@@ -6,7 +6,7 @@ area: area:ops
 size: S
 depends_on: [6]
 blocks: [18]
-status: todo
+status: in-progress
 assignee:
 ---
 
@@ -25,18 +25,21 @@ value and left broken.
 
 ## Tasks
 
-- [ ] Write a user unit with `Type=simple`, `ExecStart`, and `Restart=on-failure` (not
+- [x] Write a user unit with `Type=simple`, `ExecStart`, and `Restart=on-failure` (not
       `always` — a clean shutdown must stay shut down).
-- [ ] Set `RestartSec` and a start-limit to prevent restart storms.
-- [ ] Apply hardening: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
-      `ProtectHome=read-only` with explicit `ReadWritePaths` for the data, log, and socket
-      directories.
-- [ ] Set `KillSignal=SIGTERM` and a `TimeoutStopSec` longer than the drain deadline from
-      [#6](0006-lifecycle-and-single-instance.md), so shutdown is never truncated mid-checkpoint.
-- [ ] Add `WantedBy=default.target` for the user session.
-- [ ] Document `systemctl --user enable/start/status` and `journalctl --user -u` usage.
+- [x] Set `RestartSec` and a start-limit to prevent restart storms.
+- [x] Apply hardening: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
+      `ProtectHome=read-only` with explicit `ReadWritePaths` for the data and log
+      directories (socket directory arrives with the gRPC edge).
+- [x] Set `KillSignal=SIGTERM` and a `TimeoutStopSec` (40s) longer than the engine's drain
+      (10s) + runtime shutdown (20s) bounds from [#6](0006-lifecycle-and-single-instance.md),
+      so shutdown is never truncated mid-checkpoint.
+- [x] Add `WantedBy=default.target` for the user session.
+- [x] Document `systemctl --user enable/start/status` and `journalctl --user -u` usage —
+      `install` prints them; boot-start-without-login documented via
+      `loginctl enable-linger`.
 - [ ] Confirm the hardening directives do not break database or log writes — verify, do not
-      assume.
+      assume. *Manual, pending — no Linux host exercised yet.*
 
 ## Acceptance criteria
 
@@ -55,3 +58,11 @@ Manual on Linux with a documented checklist.
 - Confirm each `ReadWritePaths` entry is genuinely required — remove one and observe the failure
   to prove the sandbox is real.
 - Confirm the WAL is checkpointed after `systemctl --user stop`.
+
+## Delivery note
+
+Implementation landed (`crates/engine/src/service/systemd.rs` + embedded template; template
+rendering is unit-tested cross-platform, and the run/signal lifecycle is integration-tested).
+**Remaining before `done`: the manual checklist above on a Linux host** — in particular the
+`ProtectHome=read-only` + `ReadWritePaths` interaction, which is asserted here but not yet
+proven against a real systemd.

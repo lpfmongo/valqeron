@@ -20,6 +20,12 @@ pub enum SqliteError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[error("database maintenance failed")]
+    Maintenance {
+        #[source]
+        source: rusqlite::Error,
+    },
+
     #[error(
         "database schema version {found} is newer than the {known} migration(s) this binary knows about — upgrade the binary"
     )]

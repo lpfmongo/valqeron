@@ -41,8 +41,8 @@ assignee:                # github handle, empty until picked up
 | [2](0002-workspace-scaffolding.md) | Workspace scaffolding for engine crates | M0 | engine | M | 1 | todo |
 | [3](0003-proto-v1-definitions.md) | Proto v1 service and message definitions | M1 | proto | M | 2 | todo |
 | [4](0004-codegen-and-mapping-layer.md) | Codegen pipeline and domain⇄proto mapping | M1 | proto | M | 3 | todo |
-| [5](0005-daemon-binary-bootstrap.md) | Daemon binary bootstrap | M2 | engine | M | 2 | todo |
-| [6](0006-lifecycle-and-single-instance.md) | Lifecycle: single-instance guard and graceful shutdown | M2 | engine | L | 5 | todo |
+| [5](0005-daemon-binary-bootstrap.md) | Daemon binary bootstrap | M2 | engine | M | 2 | done |
+| [6](0006-lifecycle-and-single-instance.md) | Lifecycle: single-instance guard and graceful shutdown | M2 | engine | L | 5 | done |
 | [7](0007-storage-actor-core.md) | StorageActor core (async→sync bridge) ⚠️ | M3 | engine | L | 5 | todo |
 | [8](0008-dry-run-and-error-taxonomy.md) | Dry-run support and error taxonomy | M3 | engine | M | 7 | todo |
 | [9](0009-bridge-concurrency-tests.md) | Bridge concurrency tests ⚠️ | M3 | engine | M | 7 | todo |
@@ -52,8 +52,8 @@ assignee:                # github handle, empty until picked up
 | [13](0013-valqeron-client-library.md) | `valqeron-client` library | M5 | client | M | 4 | todo |
 | [14](0014-cli-dispatch-switch.md) | CLI dispatch switch (engine vs direct) | M5 | cli | L | 11, 13 | todo |
 | [15](0015-cli-engine-subcommands.md) | `valqeron engine` subcommands (status, ping) | M5 | cli | S | 13 | todo |
-| [16](0016-launchd-plist-macos.md) | launchd plist (macOS) | M6 | ops | M | 6 | todo |
-| [17](0017-systemd-unit-linux.md) | systemd unit (Linux) | M6 | ops | S | 6 | todo |
+| [16](0016-launchd-plist-macos.md) | launchd plist (macOS) | M6 | ops | M | 6 | in-progress |
+| [17](0017-systemd-unit-linux.md) | systemd unit (Linux) | M6 | ops | S | 6 | in-progress |
 | [18](0018-socket-activation.md) | Socket activation (stretch) | M6 | ops | M | 16, 17 | todo |
 | [19](0019-event-bus.md) | EventBus | M7 | engine | M | 7 | todo |
 | [20](0020-event-service-streaming.md) | EventService streaming | M7 | engine | L | 12, 19 | todo |
@@ -65,6 +65,12 @@ assignee:                # github handle, empty until picked up
 | [26](0026-architecture-doc-and-runbook.md) | Architecture doc and ops runbook | M9 | docs | M | 24, 25 | todo |
 
 ⚠️ = `risk: high`. These carry the most design uncertainty; see the item body.
+
+> **Re-sequencing note (minimal engine slice):** a minimal `valqeron-engine` shipped ahead of
+> the M1/M3 contract-and-bridge work: #5 and #6 landed (socket tasks deferred with the gRPC
+> edge), #16/#17 landed code-wise (manual service-manager checklists pending), and the engine
+> runs periodic DB maintenance — the inline precursor of #22. During this phase the engine does
+> **not** own the database exclusively; the CLI keeps direct access until #13/#14.
 
 ## Milestones
 

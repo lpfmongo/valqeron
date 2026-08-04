@@ -9,6 +9,7 @@ mod pool;
 mod pragmas;
 
 pub use config::DatabaseConfig;
+pub use database::WalCheckpointStats;
 pub use pragmas::Synchronous;
 
 pub(crate) use database::Database;

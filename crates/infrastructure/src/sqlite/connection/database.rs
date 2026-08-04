@@ -10,6 +10,18 @@ use crate::sqlite::connection::sync::{Arc, Mutex};
 use crate::sqlite::error::SqliteError;
 use crate::sqlite::migrations;
 
+/// Result of a `PRAGMA wal_checkpoint` invocation.
+#[derive(Debug, Clone, Copy)]
+pub struct WalCheckpointStats {
+    /// `1` when the checkpoint could not run to completion because another
+    /// connection kept the WAL busy, `0` otherwise.
+    pub busy: i64,
+    /// Total number of frames in the WAL file.
+    pub log_frames: i64,
+    /// Number of frames successfully transferred into the database file.
+    pub checkpointed_frames: i64,
+}
+
 pub(crate) struct Database {
     writer: SharedConnection,
     readers: ReaderSource,
@@ -85,6 +97,42 @@ impl Database {
             writer: Arc::clone(&self.writer),
             readers: self.readers.clone(),
         }
+    }
+
+    /// Periodic maintenance for long-lived processes: `PRAGMA optimize` plus
+    /// a **passive** WAL checkpoint for file-backed databases.
+    ///
+    /// `PASSIVE` is deliberate — it never blocks readers or writers in other
+    /// processes (the CLI may be using the database concurrently). The
+    /// aggressive `TRUNCATE` checkpoint remains reserved for [`Drop`], when
+    /// all in-process work has stopped.
+    ///
+    /// Returns `None` for in-memory databases (no WAL to checkpoint).
+    pub(crate) fn run_maintenance(&self) -> Result<Option<WalCheckpointStats>, SqliteError> {
+        fn maintenance_err(source: rusqlite::Error) -> SqliteError {
+            SqliteError::Maintenance { source }
+        }
+
+        let conn = lock_writer(&self.writer);
+
+        conn.execute_batch("PRAGMA optimize;")
+            .map_err(maintenance_err)?;
+
+        if !matches!(self.path, DbPath::File(_)) {
+            return Ok(None);
+        }
+
+        let stats = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                Ok(WalCheckpointStats {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(maintenance_err)?;
+
+        Ok(Some(stats))
     }
 
     pub(crate) fn dry_run<F, T>(&self, f: F) -> Result<T, StorageError>
@@ -585,6 +633,56 @@ mod tests {
 
         let db = Database::open(&path).unwrap();
         assert_eq!(count(&db.handle().read()), 5_000);
+    }
+
+    #[test]
+    fn maintenance_checkpoints_the_wal_and_keeps_it_bounded_across_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maint.db");
+        let wal_path = dir.path().join("maint.db-wal");
+
+        let db = Database::open(&path).unwrap();
+        let handle = db.handle();
+
+        // Cycle 1: write, then maintain.
+        for _ in 0..2_000 {
+            insert_dummy(&handle.write());
+        }
+        let stats = db
+            .run_maintenance()
+            .unwrap()
+            .expect("file-backed db reports checkpoint stats");
+        assert_eq!(stats.busy, 0, "no other connection should block PASSIVE");
+        assert_eq!(
+            stats.log_frames, stats.checkpointed_frames,
+            "with idle readers the full WAL must be checkpointed"
+        );
+        let wal_after_first = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+
+        // Cycle 2: same again. A full passive checkpoint lets SQLite rewind
+        // the WAL, so its size must not keep growing cycle over cycle.
+        for _ in 0..2_000 {
+            insert_dummy(&handle.write());
+        }
+        db.run_maintenance().unwrap();
+        let wal_after_second = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_after_second <= wal_after_first.saturating_mul(2),
+            "WAL must stay bounded across maintenance cycles \
+             (first: {wal_after_first} bytes, second: {wal_after_second} bytes)"
+        );
+
+        // The database stays fully usable afterwards.
+        assert_eq!(count(&db.handle().read()), 4_000);
+        insert_dummy(&handle.write());
+        assert_eq!(count(&db.handle().read()), 4_001);
+    }
+
+    #[test]
+    fn maintenance_on_in_memory_database_skips_the_checkpoint() {
+        let db = Database::open_in_memory().unwrap();
+        let stats = db.run_maintenance().unwrap();
+        assert!(stats.is_none(), "in-memory databases have no WAL");
     }
 
     #[test]

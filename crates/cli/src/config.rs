@@ -1,20 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
-
+use valqeron_config::CLI_APP;
 use valqeron_infrastructure::Synchronous;
 
 use crate::error::{AppError, AppResult};
-
-const QUALIFIER: &str = "io";
-const ORGANIZATION: &str = "valqeron";
-const SHARED_APP: &str = "valqeron";
-const CLI_APP: &str = "valqeron-cli";
-
-const DB_FILE_NAME: &str = "valqeron.db";
-const LOG_FILE_NAME: &str = "valqeron-cli.log";
-
-const DEFAULT_FILE_LOG_LEVEL: &str = "info";
 
 #[derive(Debug, Clone)]
 pub struct ValqeronConfig {
@@ -32,8 +21,9 @@ impl ValqeronConfig {
         reader_pool_size: usize,
         durable: bool,
     ) -> AppResult<Self> {
-        let db_path = resolve_db_path(db_path_flag)?;
-        let log_file = resolve_log_file(log_file_flag, no_log_file)?;
+        let db_path = valqeron_config::resolve_db_path(db_path_flag).map_err(config_err)?;
+        let log_file = valqeron_config::resolve_log_file(&CLI_APP, log_file_flag, no_log_file)
+            .map_err(config_err)?;
         Ok(Self {
             db_path,
             log_file,
@@ -51,7 +41,7 @@ impl ValqeronConfig {
     }
 
     pub fn file_log_level(&self) -> String {
-        std::env::var("VALQERON_LOG_LEVEL").unwrap_or_else(|_| DEFAULT_FILE_LOG_LEVEL.to_string())
+        valqeron_config::file_log_level(&CLI_APP)
     }
 
     pub fn reader_pool_size(&self) -> usize {
@@ -79,70 +69,8 @@ impl ValqeronConfig {
     }
 }
 
-fn shared_dirs() -> AppResult<ProjectDirs> {
-    ProjectDirs::from(QUALIFIER, ORGANIZATION, SHARED_APP).ok_or_else(|| {
-        AppError::Config("could not determine a home directory for the database".into())
-    })
-}
-
-fn cli_dirs() -> AppResult<ProjectDirs> {
-    ProjectDirs::from(QUALIFIER, ORGANIZATION, CLI_APP)
-        .ok_or_else(|| AppError::Config("could not determine a home directory for logs".into()))
-}
-
-fn resolve_db_path(flag: Option<PathBuf>) -> AppResult<PathBuf> {
-    if let Some(path) = flag {
-        return Ok(path);
-    }
-    if let Some(env) = std::env::var_os("VALQERON_DB") {
-        return Ok(PathBuf::from(env));
-    }
-    Ok(shared_dirs()?.data_dir().join(DB_FILE_NAME))
-}
-
-fn resolve_log_file(
-    flag: Option<Option<PathBuf>>,
-    no_log_file: bool,
-) -> AppResult<Option<PathBuf>> {
-    // Explicit opt-out always wins.
-    if no_log_file {
-        return Ok(None);
-    }
-
-    match flag {
-        // `--log-file <PATH>` explicitly pins a path.
-        Some(Some(path)) => Ok(Some(path)),
-        // `--log-file` with no value → default location.
-        Some(None) => Ok(Some(default_log_file()?)),
-        // Flag absent → consult env; otherwise file logging is on by default.
-        None => match std::env::var_os("VALQERON_LOG_FILE") {
-            // `VALQERON_LOG_FILE=off` (case-insensitive) disables file logging.
-            Some(env) if is_off(&env) => Ok(None),
-            Some(env) => Ok(Some(PathBuf::from(env))),
-            None => Ok(Some(default_log_file()?)),
-        },
-    }
-}
-
-fn is_off(value: &std::ffi::OsStr) -> bool {
-    value
-        .to_str()
-        .map(|s| {
-            matches!(
-                s.trim().to_ascii_lowercase().as_str(),
-                "off" | "false" | "0" | "none"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn default_log_file() -> AppResult<PathBuf> {
-    let dirs = cli_dirs()?;
-    let dir = dirs
-        .state_dir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| dirs.data_dir().join("logs"));
-    Ok(dir.join(LOG_FILE_NAME))
+fn config_err(err: valqeron_config::ConfigError) -> AppError {
+    AppError::Config(err.to_string())
 }
 
 #[cfg(test)]
@@ -182,7 +110,7 @@ mod tests {
         )
         .unwrap();
         let log = cfg.log_file().expect("default log path");
-        assert!(log.ends_with(LOG_FILE_NAME));
+        assert!(log.ends_with(CLI_APP.log_file_name));
     }
 
     #[test]
@@ -191,7 +119,7 @@ mod tests {
         let cfg = ValqeronConfig::resolve(Some(PathBuf::from("/tmp/x.db")), None, false, 4, false)
             .unwrap();
         let log = cfg.log_file().expect("default log path when flag absent");
-        assert!(log.ends_with(LOG_FILE_NAME));
+        assert!(log.ends_with(CLI_APP.log_file_name));
     }
 
     #[test]
@@ -213,16 +141,5 @@ mod tests {
         let cfg = ValqeronConfig::resolve(Some(PathBuf::from("/tmp/x.db")), None, false, 4, true)
             .unwrap();
         assert_eq!(cfg.synchronous(), Synchronous::Full);
-    }
-
-    #[test]
-    fn is_off_recognizes_disable_values() {
-        use std::ffi::OsStr;
-        for v in ["off", "OFF", "Off", "false", "0", "none", "  off  "] {
-            assert!(is_off(OsStr::new(v)), "{v:?} should disable");
-        }
-        for v in ["on", "1", "true", "/tmp/logs/x.log"] {
-            assert!(!is_off(OsStr::new(v)), "{v:?} should not disable");
-        }
     }
 }

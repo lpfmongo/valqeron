@@ -4,6 +4,8 @@ members = [
     "crates/core",
     "crates/infrastructure",
     "crates/cli",
+    "crates/config",
+    "crates/engine",
 ]
 
 [workspace.package]
@@ -17,6 +19,7 @@ version = "0.1.0"
 valqeron-core = { path = "crates/core" }
 valqeron-cli = { path = "crates/cli" }
 valqeron-infrastructure = { path = "crates/infrastructure" }
+valqeron-config = { path = "crates/config" }
 
 thiserror = "2"
 uuid = { version = "1", features = ["v7"] }
@@ -34,6 +37,7 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6"
+tokio = { version = "1", features = ["rt", "time", "signal", "macros"] }
 
 [profile.release]
 codegen-units = 1

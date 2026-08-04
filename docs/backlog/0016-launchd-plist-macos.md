@@ -32,8 +32,9 @@ A system-wide daemon would contradict both.
 - [x] Point `StandardOutPath`/`StandardErrorPath` at the log directory resolved in
       [#5](0005-daemon-binary-bootstrap.md); document interaction with the JSON log file.
 - [x] Parameterise the binary path and any env overrides (`VALQERON_DB`) rather than hardcoding.
-- [ ] Verify SIGTERM from `launchctl` triggers the graceful shutdown sequence from
-      [#6](0006-lifecycle-and-single-instance.md). *Manual checklist below — pending.*
+- [x] Verify SIGTERM from `launchctl` triggers the graceful shutdown sequence from
+      [#6](0006-lifecycle-and-single-instance.md). *Verified 2026-08-04: `launchctl kill
+      -TERM` → ordered shutdown, WAL truncated to 0 bytes, lock file removed.*
 - [x] Provide install/uninstall — implemented as `valqeron-engine install|uninstall|status`
       subcommands. *Rationale:* a built-in command renders the template from the actual
       binary location (`current_exe`) and cannot drift from the shipped binary, unlike
@@ -54,15 +55,28 @@ A system-wide daemon would contradict both.
 
 Manual on macOS, with a documented checklist (CI cannot cover launchd).
 
-- Install, verify running, `SIGKILL` and confirm restart.
-- `engine shutdown` and confirm **no** restart — the most likely misconfiguration.
-- Force a startup failure (hold the lock from another process) and confirm throttling.
-- Confirm the WAL is checkpointed after `launchctl bootout`.
+- [x] Install, verify running, `SIGKILL` and confirm restart.
+- [x] Clean stop (`launchctl kill -TERM`) and confirm **no** restart — the most likely
+      misconfiguration.
+- [x] Force a startup failure (hold the lock from another process) and confirm throttling.
+- [x] Confirm the WAL is checkpointed after `launchctl bootout` / clean stop.
+- [ ] Agent starts at login (requires a logout/login cycle).
 
 ## Delivery note
 
 Implementation landed (`crates/engine/src/service/launchd.rs` + embedded template;
 template rendering is unit-tested and the run/signal lifecycle is integration-tested).
-**Remaining before `done`: execute the manual checklist above on macOS.** One nuance to
-verify deliberately: a lock-held startup failure exits `3`, which `SuccessfulExit: false`
-treats as restartable — `ThrottleInterval` (30s) is what keeps that loop tame.
+
+**Manual checklist executed 2026-08-04 on macOS:**
+
+- `SIGKILL` → launchd respawned the agent within ~4s (new pid); the stale lock file never
+  blocked the restart.
+- `launchctl kill -TERM` → ordered shutdown (drain → final `wal_checkpoint(TRUNCATE)` →
+  lock removed); agent stayed stopped for >40s (`SuccessfulExit: false` correctly leaves
+  clean exits alone).
+- Lock held by a foreground engine + `launchctl kickstart` → exit-3 startup failures were
+  throttled to one attempt per ~30s (3 attempts / 75s, each naming the holder pid), then
+  recovered automatically on the first attempt after the lock freed.
+- `uninstall` → no residue: plist removed, agent unloaded, lock file gone, WAL 0 bytes.
+
+**Remaining before `done`: verify the agent starts after a logout/login cycle.**

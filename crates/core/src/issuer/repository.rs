@@ -1,30 +1,10 @@
 use crate::issuer::patch::IssuerPatch;
 use crate::issuer::{Issuer, IssuerId};
-use crate::storage::StorageFault;
 use ftracker_identifiers::{Cnpj, Lei};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::common::Versioned;
-
-pub type RepositoryResult<T> = Result<T, StorageFault>;
-
-#[must_use = "a write outcome may indicate the write did not apply"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteOutcome {
-    Applied,
-
-    VersionMismatch { expected: u32, actual: u32 },
-
-    Missing,
-}
-
-impl WriteOutcome {
-    #[must_use]
-    pub const fn applied(self) -> bool {
-        matches!(self, Self::Applied)
-    }
-}
+use crate::common::{RepositoryResult, Versioned, WriteOutcome};
 
 #[cfg_attr(test, mockall::automock)]
 pub trait IssuerRepository {

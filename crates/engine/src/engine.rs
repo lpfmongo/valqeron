@@ -28,6 +28,7 @@
 //! → release the lock last, after the checkpoint proves the database is quiesced.
 
 use crate::grpc::{AdminGrpc, IssuerGrpc};
+use crate::lifecycle::{Lifecycle, LifecycleState};
 use crate::storage::AsyncStorage;
 use crate::tasks::{
     BackgroundTasksBuilder, BackgroundTasksManager, PeriodicSpec, TaskFailure, Tracking,
@@ -42,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use valqeron_core::{BackgroundTaskRepository, StorageError};
@@ -641,9 +643,19 @@ pub struct ValqeronEngine<'c> {
 
 impl ValqeronEngine<'_> {
     /// The one public entry point: drive the full boot sequence, serve until
-    /// a shutdown signal, then tear down in checkpoint-safe order.
+    /// a shutdown signal, then tear down in checkpoint-safe order. The
+    /// runtime lifecycle FSM (`lifecycle.rs`) tracks the coarse state:
+    /// `Starting` here, `Ready`/`Stopping` inside [`run_loop`], and the
+    /// terminal `Stopped`/`Failed` at the end of [`ValqeronEngine::serve`].
     pub fn run(config: &EngineConfig) -> EngineResult<()> {
-        Self::boot(config)?.serve()
+        let (lifecycle, state) = Lifecycle::new();
+        match Self::boot(config) {
+            Ok(engine) => engine.serve(&lifecycle, state),
+            Err(e) => {
+                let _ = lifecycle.transition(LifecycleState::Failed);
+                Err(e)
+            }
+        }
     }
 
     /// Drive the phased boot chain: lock → socket prep → open (migrations) →
@@ -660,7 +672,11 @@ impl ValqeronEngine<'_> {
     /// Serve until shutdown, then tear down in reverse-dependency order:
     /// drain the runtime → unlink the socket → reclaim and drop the engine
     /// (final `wal_checkpoint(TRUNCATE)`) → release the lock last.
-    fn serve(self) -> EngineResult<()> {
+    fn serve(
+        self,
+        lifecycle: &Lifecycle,
+        state: watch::Receiver<LifecycleState>,
+    ) -> EngineResult<()> {
         let Self {
             config,
             lock,
@@ -669,7 +685,13 @@ impl ValqeronEngine<'_> {
             runtime,
         } = self;
 
-        let loop_result = runtime.block_on(run_loop(storage.clone(), listener, config));
+        let loop_result = runtime.block_on(run_loop(
+            storage.clone(),
+            listener,
+            config,
+            lifecycle,
+            state,
+        ));
 
         // Wait (bounded) for any still-running blocking task before the final
         // checkpoint; queued-but-unstarted tasks are dropped.
@@ -691,11 +713,30 @@ impl ValqeronEngine<'_> {
         }
 
         drop(lock);
-        tracing::info!(
-            target: "valqeron::audit",
-            operation = "engine_stop",
-            "engine stopped cleanly"
-        );
+
+        // The terminal transition lands only now, after the checkpoint and
+        // lock release: "stopped"/"failed" factually means everything is
+        // drained and released. Legal from Stopping (clean/forced/server
+        // death) and from Starting (run_loop failed before readiness).
+        let terminal = match &loop_result {
+            Ok(()) => LifecycleState::Stopped,
+            Err(_) => LifecycleState::Failed,
+        };
+        let _ = lifecycle.transition(terminal);
+
+        match &loop_result {
+            Ok(()) => tracing::info!(
+                target: "valqeron::audit",
+                operation = "engine_stop",
+                "engine stopped cleanly"
+            ),
+            Err(e) => tracing::warn!(
+                target: "valqeron::audit",
+                operation = "engine_stop",
+                error = %e,
+                "engine stopped with an error"
+            ),
+        }
         loop_result
     }
 }
@@ -803,8 +844,13 @@ const TASK_PRUNE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The engine's built-in background work, as one registry + schedule set:
 /// `db_maintenance` and `task_prune` leave durable history rows in
-/// `background_task`; the heartbeat is a pure liveness log line (ephemeral).
-fn background_tasks(config: &EngineConfig, started: Instant) -> BackgroundTasksBuilder {
+/// `background_task`; the heartbeat is a pure liveness log line (ephemeral)
+/// reporting the observed lifecycle state.
+fn background_tasks(
+    config: &EngineConfig,
+    started: Instant,
+    state: watch::Receiver<LifecycleState>,
+) -> BackgroundTasksBuilder {
     BackgroundTasksManager::builder()
         .handler(DB_MAINTENANCE_TASK, |ctx| async move {
             match ctx
@@ -817,13 +863,18 @@ fn background_tasks(config: &EngineConfig, started: Instant) -> BackgroundTasksB
                 Err(e) => Err(TaskFailure::new(e.to_string())),
             }
         })
-        .handler(HEARTBEAT_TASK, move |_ctx| async move {
-            tracing::debug!(
-                job = "heartbeat",
-                uptime_secs = started.elapsed().as_secs(),
-                "engine alive"
-            );
-            Ok(())
+        .handler(HEARTBEAT_TASK, move |_ctx| {
+            let state = state.clone();
+            async move {
+                let current = *state.borrow();
+                tracing::debug!(
+                    job = "heartbeat",
+                    state = current.as_str(),
+                    uptime_secs = started.elapsed().as_secs(),
+                    "engine alive"
+                );
+                Ok(())
+            }
         })
         .handler(TASK_PRUNE_TASK, |ctx| async move {
             let Some(cutoff) =
@@ -885,25 +936,28 @@ async fn run_loop(
     storage: AsyncStorage,
     listener: StdUnixListener,
     config: &EngineConfig,
+    lifecycle: &Lifecycle,
+    state: watch::Receiver<LifecycleState>,
 ) -> EngineResult<()> {
     let mut signals = Signals::install()?;
     let started = Instant::now();
     let mut server = GrpcServer::spawn(listener, &storage, config, started)?;
 
     // The deterministic readiness point: lock held, migrations applied,
-    // socket bound, server task serving. Under a systemd Type=notify unit
-    // this completes startup; everywhere else the notify call is a no-op.
+    // socket bound, server task serving. The Starting → Ready transition
+    // fires sd_notify READY=1 — under a systemd Type=notify unit this
+    // completes startup; everywhere else it is a no-op.
     tracing::info!(
         target: "valqeron::audit",
         operation = "engine_ready",
         socket = %config.socket_path().display(),
         "engine ready"
     );
-    crate::notify::notify_ready();
+    let _ = lifecycle.transition(LifecycleState::Ready);
 
     // Background work (crash recovery, periodic schedules, the dispatcher)
     // runs on its own tasks; the select below stays a pure watcher.
-    let tasks = background_tasks(config, started)
+    let tasks = background_tasks(config, started, state)
         .start(storage.clone())
         .await;
 
@@ -912,8 +966,9 @@ async fn run_loop(
         joined = &mut server.join => Err(server_exit_error(joined)),
     };
 
-    // Every continuation from here is a shutdown, clean or not.
-    crate::notify::notify_stopping();
+    // Every continuation from here is a shutdown, clean or not; the
+    // Ready → Stopping transition fires sd_notify STOPPING=1.
+    let _ = lifecycle.transition(LifecycleState::Stopping);
 
     match outcome {
         Ok(reason) => {

@@ -31,6 +31,7 @@
 
 mod engine;
 mod grpc;
+mod lifecycle;
 mod notify;
 mod storage;
 mod tasks;

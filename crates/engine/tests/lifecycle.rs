@@ -244,6 +244,23 @@ fn starts_heartbeats_and_shuts_down_cleanly_on_sigterm() {
         "shutdown audit line missing:\n{stderr}"
     );
 
+    // The lifecycle FSM walks its clean path, in order.
+    let transitions = [
+        r#"from="starting" to="ready""#,
+        r#"from="ready" to="stopping""#,
+        r#"from="stopping" to="stopped""#,
+    ];
+    let mut search_from = 0;
+    for transition in transitions {
+        let found = stderr
+            .get(search_from..)
+            .and_then(|tail| tail.find(transition))
+            .unwrap_or_else(|| {
+                panic!("lifecycle transition {transition:?} missing or out of order:\n{stderr}")
+            });
+        search_from += found + transition.len();
+    }
+
     // Drop's wal_checkpoint(TRUNCATE) leaves the WAL empty (or removed).
     let wal = std::fs::metadata(db.with_extension("db-wal"))
         .map(|m| m.len())
@@ -285,6 +302,10 @@ fn second_instance_fails_fast_naming_holder() {
     assert!(
         stderr.contains("it.db"),
         "error names the database:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(r#"from="starting" to="failed""#),
+        "a boot failure must transition Starting -> Failed:\n{stderr}"
     );
 
     first.signal("-TERM");

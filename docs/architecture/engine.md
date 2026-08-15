@@ -55,6 +55,9 @@ main.rs ── no argv (any argument is a config error) + logging init: stderr
 │                 socket prep → open → bind → runtime), run_loop (serve →
 │                 signal → ordered drain), checkpoint-safe teardown, exit codes
 ├── storage.rs    AsyncStorage: the async→sync bridge (read/write lanes)
+├── lifecycle.rs  the runtime lifecycle FSM: Starting→Ready→Stopping→
+│                 Stopped/Failed, exhaustive transition table, watch-based
+│                 observers, sd_notify side effects fired on transition
 ├── tasks.rs      BackgroundTasksManager: handler registry, periodic schedules
 │                 (durable or ephemeral), the dispatcher over the persisted
 │                 background_task queue, retry/backoff, crash recovery
@@ -120,15 +123,35 @@ Every mutating RPC carries `dry_run: bool`. The handler passes the flag to `Asyn
 closure body in `StorageEngine::dry_run` — a savepoint that always rolls back. One RPC = one dry-run scope; there are
 no multi-RPC dry-run sessions. The CLI's `--dry-run` simply sets the flag.
 
-### Lifecycle (`engine.rs`)
+### Lifecycle (`engine.rs`, `lifecycle.rs`)
 
-Startup is a typed phase chain (mis-ordering does not compile): acquire exclusive flock on `<db>.lock`
+The lifecycle has two enforcement layers. **Compile time:** startup is a typed phase chain (mis-ordering does not
+compile). **Runtime:** one coarse, observable finite state machine (`lifecycle.rs`) with an exhaustive transition
+table — a single non-`Clone` authority transitions it, `watch` observers read it (the heartbeat logs the current
+state), and the sd_notify side effects fire exactly at the transition that makes them true:
+
+```text
+Starting ──boot ok──────────────▶ Ready      (fires READY=1)
+Starting ──boot/run_loop error──▶ Failed
+Ready ────signal/server death───▶ Stopping   (fires STOPPING=1)
+Stopping ─drain complete────────▶ Stopped    (terminal, exit 0)
+Stopping ─forced/drain error────▶ Failed     (terminal, exit ≠ 0)
+```
+
+Rules: terminal states absorb (no exits); `Starting → Stopping` is unrepresentable (signal handlers install only
+after boot — a signal during boot kills the process via default disposition); `Ready → Failed` does not exist (every
+failure drains first, so it passes through `Stopping`); the terminal transition lands only after the final checkpoint
+and lock release, so `stopped`/`failed` factually means everything was released. An invalid transition is a logged
+error, never a panic — the state stays put. Every transition is an audit event (`lifecycle_transition`, with
+`from`/`to`).
+
+Startup, in phase order: acquire exclusive flock on `<db>.lock`
 → ensure socket dir exists with `0700` + unlink any stale socket (safe: we hold the lock, so no live engine serves on
 it) → open database (migrations run here; the engine is the sole migration runner) → bind `UnixListener` (nonblocking),
 chmod socket `0600` → build `multi_thread` runtime (named threads, blocking pool capped to the storage lanes) → serve
-`RpcIssuerService` + `RpcAdminService`. Once serving, the engine emits the `engine_ready` audit event and sd_notify
-`READY=1` — the socket file's existence still proves the database is open and migrated, because the bind follows the
-open.
+`RpcIssuerService` + `RpcAdminService`. Once serving, the engine emits the `engine_ready` audit event and transitions
+`Starting → Ready` (which fires `READY=1`) — the socket file's existence still proves the database is open and
+migrated, because the bind follows the open.
 
 Steady state: `run_loop` is a pure watcher — a `select!` over SIGTERM/SIGINT/unexpected server exit — while background
 work runs under the `BackgroundTasksManager` (`tasks.rs`). The manager owns a handler registry (`kind → handler`),
@@ -142,15 +165,16 @@ are gated on an active-row check, so one kind never piles up or runs overlapped.
 
 Shutdown (order matters — the final checkpoint must not race in-flight writes):
 
-1. Signal → sd_notify `STOPPING=1` → stop accepting, drain in-flight RPCs (tonic graceful shutdown, ≤10s; second
-   signal forces exit 1).
+1. Signal → `Ready → Stopping` (fires `STOPPING=1`) → stop accepting, drain in-flight RPCs (tonic graceful shutdown,
+   ≤10s; second signal forces exit 1, `Stopping → Failed`).
 2. Drain background tasks — tickers and the dispatcher stop, in-flight runs finish and record their outcome (≤10s; a
    run cut off here is exactly the crash-recovery case at next boot).
 3. `storage.close()` → new calls rejected; wait idle (≤10s).
 4. Runtime `shutdown_timeout` (≤20s) — service-manager SIGKILL is the final backstop.
 5. Unlink socket, reclaim the engine via `Arc::try_unwrap` → drop = `PRAGMA optimize` +
    `wal_checkpoint(TRUNCATE)`. The lane drain makes this deterministic.
-6. Release the lock last, after the checkpoint proves the DB is quiesced.
+6. Release the lock last, after the checkpoint proves the DB is quiesced, then land the terminal transition:
+   `Stopping → Stopped` (clean) or `→ Failed`.
 
 Exit codes: `0` clean, `1` runtime/forced, `2` config, `3` already running (lock held).
 launchd/systemd restart policies key off these.

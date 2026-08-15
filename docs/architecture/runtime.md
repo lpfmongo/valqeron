@@ -141,7 +141,8 @@ cancel-safe (a dropped waiter simply leaves the queue).
 
 ```
 signal (SIGTERM/SIGINT)
-  └─ STOPPING=1; stop accepting; drain in-flight RPCs        ≤ 10s  (2nd signal → exit 1)
+  └─ Ready → Stopping (fires STOPPING=1); stop accepting;    ≤ 10s  (2nd signal → exit 1,
+     drain in-flight RPCs                                            Stopping → Failed)
       └─ drain background tasks (tickers + dispatcher stop;   ≤ 10s
          in-flight runs finish and record their outcome)
           └─ storage.close(): new calls → ShuttingDown
@@ -152,7 +153,11 @@ signal (SIGTERM/SIGINT)
                              PRAGMA optimize + wal_checkpoint(TRUNCATE)
                               └─ release <db>.lock — last, after the checkpoint
                                  proves the database is quiesced
+                                  └─ Stopping → Stopped (clean) or → Failed
 ```
+
+The lifecycle FSM behind these labels lives in `lifecycle.rs` (exhaustive transition table,
+watch-based observers, sd_notify fired on transition) — see [engine.md](engine.md) §Lifecycle.
 
 The lane drain is what makes the final checkpoint deterministic: `Arc::try_unwrap` succeeds only
 when no closure still holds the engine. The service-manager stop timeout (60 s in the unit

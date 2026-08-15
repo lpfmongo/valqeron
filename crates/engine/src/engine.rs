@@ -28,8 +28,10 @@
 //! → release the lock last, after the checkpoint proves the database is quiesced.
 
 use crate::grpc::{AdminGrpc, IssuerGrpc};
-use crate::jobs::{JobSet, PeriodicJob};
 use crate::storage::AsyncStorage;
+use crate::tasks::{
+    BackgroundTasksBuilder, BackgroundTasksManager, PeriodicSpec, TaskFailure, Tracking,
+};
 use directories::ProjectDirs;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
@@ -42,6 +44,7 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
+use valqeron_core::{BackgroundTaskRepository, StorageError};
 use valqeron_infrastructure::{DatabaseConfig, SqliteStorageEngine, Synchronous};
 use valqeron_proto::v1::rpc_admin_service_server::RpcAdminServiceServer;
 use valqeron_proto::v1::rpc_issuer_service_server::RpcIssuerServiceServer;
@@ -697,51 +700,195 @@ impl ValqeronEngine<'_> {
     }
 }
 
+// ================ SIGNALS ================
+/// The two shutdown signals, installed once and polled across both the serve
+/// and the drain phases (a second delivery during the drain forces exit).
+struct Signals {
+    sigterm: tokio::signal::unix::Signal,
+    sigint: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> EngineResult<Self> {
+        Ok(Self {
+            sigterm: signal(SignalKind::terminate())
+                .map_err(|e| EngineError::Io(format!("installing SIGTERM handler: {e}")))?,
+            sigint: signal(SignalKind::interrupt())
+                .map_err(|e| EngineError::Io(format!("installing SIGINT handler: {e}")))?,
+        })
+    }
+
+    /// Resolves on the next delivery of either signal, naming it.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.sigterm.recv() => "SIGTERM",
+            _ = self.sigint.recv() => "SIGINT",
+        }
+    }
+}
+
+// ================ GRPC SERVER ================
+/// The spawned tonic server plus its graceful-shutdown trigger.
+struct GrpcServer {
+    join: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl GrpcServer {
+    /// Register the bootstrap-bound listener with this runtime's reactor and
+    /// spawn the tonic server on it. Connections that queued in the backlog
+    /// while the runtime was being built are served as soon as tonic starts.
+    fn spawn(
+        listener: StdUnixListener,
+        storage: &AsyncStorage,
+        config: &EngineConfig,
+        started: Instant,
+    ) -> EngineResult<Self> {
+        let listener = UnixListener::from_std(listener).map_err(|e| {
+            EngineError::Io(format!(
+                "registering socket {} with the runtime: {e}",
+                config.socket_path().display()
+            ))
+        })?;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let issuer_service = RpcIssuerServiceServer::new(IssuerGrpc::new(storage.clone()));
+        let admin_service = RpcAdminServiceServer::new(AdminGrpc::new(
+            config.db_path().display().to_string(),
+            started,
+        ));
+
+        let join = tokio::spawn(
+            Server::builder()
+                .add_service(issuer_service)
+                .add_service(admin_service)
+                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                }),
+        );
+
+        tracing::info!(
+            target: "valqeron::audit",
+            operation = "grpc_listen",
+            socket = %config.socket_path().display(),
+            "gRPC server listening"
+        );
+
+        Ok(Self {
+            join,
+            shutdown: Some(shutdown_tx),
+        })
+    }
+
+    /// Stop accepting connections and begin draining in-flight RPCs.
+    fn begin_shutdown(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+// ================ BACKGROUND TASK REGISTRATIONS ================
+/// Task kinds the engine registers — also the `kind` values persisted in the
+/// `background_task` table.
+const DB_MAINTENANCE_TASK: &str = "db_maintenance";
+const HEARTBEAT_TASK: &str = "heartbeat";
+const TASK_PRUNE_TASK: &str = "task_prune";
+
+/// How long terminal task rows are kept before `task_prune` deletes them.
+const TASK_RETENTION_DAYS: i64 = 7;
+
+/// How often `task_prune` runs.
+const TASK_PRUNE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The engine's built-in background work, as one registry + schedule set:
+/// `db_maintenance` and `task_prune` leave durable history rows in
+/// `background_task`; the heartbeat is a pure liveness log line (ephemeral).
+fn background_tasks(config: &EngineConfig, started: Instant) -> BackgroundTasksBuilder {
+    BackgroundTasksManager::builder()
+        .handler(DB_MAINTENANCE_TASK, |ctx| async move {
+            match ctx
+                .storage
+                .maintenance(DB_MAINTENANCE_TASK, run_maintenance_job)
+                .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(TaskFailure::new(e)),
+                Err(e) => Err(TaskFailure::new(e.to_string())),
+            }
+        })
+        .handler(HEARTBEAT_TASK, move |_ctx| async move {
+            tracing::debug!(
+                job = "heartbeat",
+                uptime_secs = started.elapsed().as_secs(),
+                "engine alive"
+            );
+            Ok(())
+        })
+        .handler(TASK_PRUNE_TASK, |ctx| async move {
+            let Some(cutoff) =
+                chrono::Utc::now().checked_sub_signed(chrono::Duration::days(TASK_RETENTION_DAYS))
+            else {
+                // Unrepresentable retention window; nothing sane to prune.
+                return Ok(());
+            };
+            let pruned = ctx
+                .storage
+                .write(TASK_PRUNE_TASK, false, move |repos| {
+                    repos
+                        .tasks
+                        .prune_finished(cutoff)
+                        .map_err(StorageError::from)
+                })
+                .await;
+            match pruned {
+                Ok(Ok(removed)) => {
+                    tracing::info!(
+                        target: "valqeron::audit",
+                        operation = "task_prune",
+                        removed,
+                        retention_days = TASK_RETENTION_DAYS,
+                        "pruned terminal background task rows"
+                    );
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(TaskFailure::new(e.to_string())),
+                Err(e) => Err(TaskFailure::new(e.to_string())),
+            }
+        })
+        .periodic(PeriodicSpec {
+            kind: DB_MAINTENANCE_TASK,
+            period: config.maintenance_interval(),
+            jitter: true,
+            tracking: Tracking::Durable,
+        })
+        .periodic(PeriodicSpec {
+            kind: HEARTBEAT_TASK,
+            period: config.heartbeat_interval(),
+            jitter: false,
+            tracking: Tracking::Ephemeral,
+        })
+        .periodic(PeriodicSpec {
+            kind: TASK_PRUNE_TASK,
+            period: TASK_PRUNE_PERIOD,
+            jitter: true,
+            tracking: Tracking::Durable,
+        })
+}
+
 // ================ SERVE LOOP ================
+/// Serve until a shutdown signal arrives or the server dies on its own, then
+/// hand off to the ordered drain. The mechanics live in [`Signals`],
+/// [`GrpcServer`], [`background_tasks`], and [`graceful_shutdown`]; this
+/// function is only the orchestration order.
 async fn run_loop(
     storage: AsyncStorage,
     listener: StdUnixListener,
     config: &EngineConfig,
 ) -> EngineResult<()> {
-    let mut sigterm = signal(SignalKind::terminate())
-        .map_err(|e| EngineError::Io(format!("installing SIGTERM handler: {e}")))?;
-    let mut sigint = signal(SignalKind::interrupt())
-        .map_err(|e| EngineError::Io(format!("installing SIGINT handler: {e}")))?;
-
+    let mut signals = Signals::install()?;
     let started = Instant::now();
-
-    // The listener was bound (nonblocking) during bootstrap; register it with
-    // this runtime's reactor. Connections that queued in the backlog while
-    // the runtime was being built are served as soon as tonic starts.
-    let listener = UnixListener::from_std(listener).map_err(|e| {
-        EngineError::Io(format!(
-            "registering socket {} with the runtime: {e}",
-            config.socket_path().display()
-        ))
-    })?;
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let issuer_service = RpcIssuerServiceServer::new(IssuerGrpc::new(storage.clone()));
-    let admin_service = RpcAdminServiceServer::new(AdminGrpc::new(
-        config.db_path().display().to_string(),
-        started,
-    ));
-
-    let mut server = tokio::spawn(
-        Server::builder()
-            .add_service(issuer_service)
-            .add_service(admin_service)
-            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
-                let _ = shutdown_rx.await;
-            }),
-    );
-
-    tracing::info!(
-        target: "valqeron::audit",
-        operation = "grpc_listen",
-        socket = %config.socket_path().display(),
-        "gRPC server listening"
-    );
+    let mut server = GrpcServer::spawn(listener, &storage, config, started)?;
 
     // The deterministic readiness point: lock held, migrations applied,
     // socket bound, server task serving. Under a systemd Type=notify unit
@@ -754,82 +901,55 @@ async fn run_loop(
     );
     crate::notify::notify_ready();
 
-    // Background work runs as periodic jobs on their own tasks; the select
-    // loop below stays a pure signal/server watcher.
-    let mut jobs = JobSet::new();
-    jobs.spawn(
-        PeriodicJob {
-            name: "db_maintenance",
-            period: config.maintenance_interval(),
-            jitter: true,
-        },
-        {
-            let storage = storage.clone();
-            move || {
-                let storage = storage.clone();
-                async move {
-                    if let Err(e) = storage
-                        .maintenance("db_maintenance", run_maintenance_job)
-                        .await
-                    {
-                        tracing::warn!(
-                            job = "db_maintenance",
-                            error = %e,
-                            "maintenance not executed"
-                        );
-                    }
-                }
-            }
-        },
-    );
-    jobs.spawn(
-        PeriodicJob {
-            name: "heartbeat",
-            period: config.heartbeat_interval(),
-            jitter: false,
-        },
-        move || async move {
-            tracing::debug!(
-                job = "heartbeat",
-                uptime_secs = started.elapsed().as_secs(),
-                "engine alive"
-            );
-        },
-    );
+    // Background work (crash recovery, periodic schedules, the dispatcher)
+    // runs on its own tasks; the select below stays a pure watcher.
+    let tasks = background_tasks(config, started)
+        .start(storage.clone())
+        .await;
 
-    // Serve until a signal arrives or the server dies on its own; the
-    // periodic jobs run on their own tasks in the meantime.
     let outcome: EngineResult<&'static str> = tokio::select! {
-        _ = sigterm.recv() => Ok("SIGTERM"),
-        _ = sigint.recv() => Ok("SIGINT"),
-        joined = &mut server => Err(server_exit_error(joined)),
+        reason = signals.recv() => Ok(reason),
+        joined = &mut server.join => Err(server_exit_error(joined)),
     };
 
     // Every continuation from here is a shutdown, clean or not.
     crate::notify::notify_stopping();
 
-    let reason = match outcome {
-        Ok(reason) => reason,
+    match outcome {
+        Ok(reason) => {
+            tracing::info!(
+                signal = reason,
+                "shutdown requested; draining in-flight RPCs and background work"
+            );
+            graceful_shutdown(signals, server, tasks, &storage).await
+        }
         Err(e) => {
             // The server died on its own; stop background work and bail.
-            let _ = jobs.drain(Duration::from_secs(1)).await;
+            let _ = tasks.drain(Duration::from_secs(1)).await;
             storage.close();
-            return Err(e);
+            Err(e)
         }
-    };
+    }
+}
 
-    tracing::info!(
-        signal = reason,
-        "shutdown requested; draining in-flight RPCs and background work"
-    );
-
-    // Stop accepting connections and drain in-flight RPCs. A second signal
-    // during the drain forces an immediate (non-zero) exit.
-    let _ = shutdown_tx.send(());
+/// The ordered drain: stop accepting RPCs and drain in-flight ones (a second
+/// signal forces an immediate non-zero exit), stop the background tasks
+/// (waiting for bodies still in flight), then reject new storage work and
+/// wait for the remaining closures — the exact reverse-dependency order the
+/// final WAL checkpoint in [`ValqeronEngine::serve`] requires.
+async fn graceful_shutdown(
+    mut signals: Signals,
+    mut server: GrpcServer,
+    tasks: BackgroundTasksManager,
+    storage: &AsyncStorage,
+) -> EngineResult<()> {
+    server.begin_shutdown();
     tokio::select! {
-        _ = sigterm.recv() => { storage.close(); return Err(EngineError::ForcedShutdown); }
-        _ = sigint.recv() => { storage.close(); return Err(EngineError::ForcedShutdown); }
-        joined = &mut server => {
+        _ = signals.recv() => {
+            storage.close();
+            return Err(EngineError::ForcedShutdown);
+        }
+        joined = &mut server.join => {
             if let Err(e) = server_join_outcome(joined) {
                 tracing::warn!(error = %e, "gRPC server ended with an error during drain");
             }
@@ -839,16 +959,14 @@ async fn run_loop(
                 drain_timeout_secs = DRAIN_TIMEOUT.as_secs(),
                 "gRPC server did not drain within the deadline; aborting it"
             );
-            server.abort();
+            server.join.abort();
         }
     }
 
-    // Stop the periodic jobs (waiting for any body still in flight), then
-    // reject new storage work and wait for in-flight closures to finish.
-    if !jobs.drain(DRAIN_TIMEOUT).await {
+    if !tasks.drain(DRAIN_TIMEOUT).await {
         tracing::warn!(
             drain_timeout_secs = DRAIN_TIMEOUT.as_secs(),
-            "background jobs did not finish within the drain deadline"
+            "background tasks did not finish within the drain deadline"
         );
     }
     storage.close();
@@ -912,26 +1030,33 @@ fn server_exit_error(
 }
 
 /// One maintenance run, executed through the storage facade — never on a
-/// runtime thread. Failures are logged and retried on the next tick; they
+/// runtime thread. Outcomes are logged here; the returned result feeds the
+/// durable task record. Failures are retried at the next periodic tick and
 /// must not take the daemon down.
-fn run_maintenance_job(engine: &SqliteStorageEngine) {
+fn run_maintenance_job(engine: &SqliteStorageEngine) -> Result<(), String> {
     let started = Instant::now();
     match engine.run_maintenance() {
-        Ok(stats) => tracing::info!(
-            target: "valqeron::audit",
-            operation = "db_maintenance",
-            busy = stats.busy,
-            wal_frames = stats.log_frames,
-            checkpointed_frames = stats.checkpointed_frames,
-            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "maintenance completed"
-        ),
-        Err(e) => tracing::warn!(
-            target: "valqeron::audit",
-            operation = "db_maintenance",
-            error = %e,
-            "maintenance failed; retrying at the next interval"
-        ),
+        Ok(stats) => {
+            tracing::info!(
+                target: "valqeron::audit",
+                operation = "db_maintenance",
+                busy = stats.busy,
+                wal_frames = stats.log_frames,
+                checkpointed_frames = stats.checkpointed_frames,
+                duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "maintenance completed"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "valqeron::audit",
+                operation = "db_maintenance",
+                error = %e,
+                "maintenance failed; retrying at the next interval"
+            );
+            Err(e.to_string())
+        }
     }
 }
 

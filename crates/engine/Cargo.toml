@@ -12,6 +12,7 @@ valqeron-core = { workspace = true }
 valqeron-infrastructure = { workspace = true }
 valqeron-proto = { workspace = true }
 valqeron-common = { workspace = true }
+chrono = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 directories = { workspace = true }

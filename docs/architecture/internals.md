@@ -19,8 +19,8 @@ valqeron CLI     │  main thread              tokio workers (N=cores)         b
 ┌────────────┐   │  ┌───────────────┐        ┌───────────────────────┐       ┌─────────────────┐    │
 │ Client      │  │  │ bootstrap     │        │ conn task ── req task │       │ storage closure │    │
 │ (blocking,  │──UDS─▶ block_on(    │        │ conn task ── req task │─lane─▶│ f(&Repositories)│    │
-│ current_    │  │  │   run_loop)   │        │ job: db_maintenance   │permits│ ≤4 read, ≤1 wr  │    │
-│ thread rt)  │  │  │ teardown      │        │ job: heartbeat        │       └───────┬─────────┘    │
+│ current_    │  │  │   run_loop)   │        │ task tickers (3)      │permits│ ≤4 read, ≤1 wr  │    │
+│ thread rt)  │  │  │ teardown      │        │ task dispatcher       │       └───────┬─────────┘    │
 └────────────┘   │  └───────────────┘        │ signal streams        │               │              │
                  │                           └───────────────────────┘               ▼              │
                  │                                             SQLite: writer Mutex + 4-reader      │
@@ -56,13 +56,14 @@ whichever blocking-pool thread holds the guard executes on them.
 | server task | `tokio::spawn(Server::…serve_with_incoming_shutdown)` | 1 | accept loop over the UDS listener stream; graceful shutdown via oneshot |
 | connection tasks | by hyper, per accepted UDS connection | 1 per client | own the HTTP/2 connection state machine (framing, flow control, stream multiplexing) |
 | request tasks | by hyper's executor, per h2 stream | 1 per in-flight RPC | poll the tonic router → service handler future |
-| job: `db_maintenance` | `jobs.spawn` in `run_loop` | 1 | jittered ±10% interval; body routes through `AsyncStorage::maintenance` |
-| job: `heartbeat` | `jobs.spawn` in `run_loop` | 1 | interval log line, no I/O |
+| periodic tickers (`db_maintenance`, `heartbeat`, `task_prune`) | `BackgroundTasksManager::start` in `run_loop` | 1 each | durable ticks enqueue a `background_task` row (gated against pileup); ephemeral ticks run inline |
+| task dispatcher | `BackgroundTasksManager::start` in `run_loop` | 1 | claims due rows (Notify-woken + 1s fallback poll), executes ≤2 concurrently, records outcomes/retries |
 | storage closures | `spawn_blocking` inside `AsyncStorage` | ≤5 concurrent | **not** worker-pool tasks — blocking-pool jobs |
 
-Job tasks are structured, not free-floating: they live in a `JoinSet`, share a `watch` shutdown
-channel, and their bodies are awaited **inline** on the job's own task (`jobs.rs`) — which is
-why overlapping runs are impossible without busy-flag bookkeeping and why `JobSet::drain`
+Background tasks are structured, not free-floating: tickers and the dispatcher live in a
+`JoinSet`, share a `watch` shutdown channel, and every durable run is a version-guarded row in
+the `background_task` table (`tasks.rs`) — which is why same-kind runs cannot overlap or pile
+up, why a crash mid-run is recoverable at boot, and why `BackgroundTasksManager::drain`
 deterministically waits for a mid-flight body.
 
 ## 3. How the tokio runtime works (and how the engine uses it)
@@ -217,7 +218,7 @@ the queueing stage instead of cascading timeouts.
 
 ```
 AsyncStorage (Clone) ──┬─ IssuerGrpc             engine: Arc<SqliteStorageEngine>
-                       ├─ maintenance job                    │
+                       ├─ BackgroundTasksManager             │
                        └─ run_loop                           ▼
                                                    Database
                                                    ├─ writer:  Arc<Mutex<Connection>>  (1, READ_WRITE|CREATE)

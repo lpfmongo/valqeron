@@ -193,6 +193,12 @@ insurance, and each retry logs a warning so firing is visible.
 - Migrations run on the writer inside `Database::open_with_config`, before any reader exists.
   The engine is the sole migration runner in production (it owns the file exclusively).
 
+Schema inventory: `issuer` (001), `security` (002), and `background_task` (003) — the
+engine-internal task queue/history (`STRICT, WITHOUT ROWID`, BLOB uuid PK, RFC 3339 TEXT
+timestamps, CHECK-constrained status, `version` for guarded writes; indexed on
+`(status, scheduled_at)` for the dispatcher's due-claim and `(kind, scheduled_at)` for
+per-kind history).
+
 ## Maintenance & shutdown
 
 Two WAL-containment paths, deliberately different in aggressiveness:

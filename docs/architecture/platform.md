@@ -57,9 +57,10 @@ and [internals.md](internals.md) (thread inventory, tokio mechanics, decision re
   │                                            server exit}        │
   │ server task ── tonic: IssuerService · AdminService             │
   │ conn task(s) ── h2 per connection ── req task per RPC          │
-  │ JobSet (JoinSet + watch shutdown)                              │
-  │   ├─ db_maintenance  jittered ±10%, bodies never overlap       │
-  │   └─ heartbeat       log line                                  │
+  │ BackgroundTasksManager (JoinSet + watch shutdown)              │
+  │   ├─ tickers: db_maintenance · heartbeat · task_prune          │
+  │   └─ dispatcher over the background_task queue (durable runs,  │
+  │      retries, crash recovery; same-kind runs never overlap)    │
   └───────┬───────────────────────────────────────┬────────────────┘
           │ handlers: proto→domain parse          │ maintenance()
           ▼                                       ▼
@@ -168,10 +169,10 @@ until serving starts.
 
 One `multi_thread` runtime (workers named `valqeron-worker`, blocking pool capped at lanes + margin instead of tokio's
 default 512). The main thread drives `run_loop` — a pure signal/server watcher — while workers run the tonic server
-task, per-connection h2 tasks, and per-RPC handler futures. Background work is structured: `PeriodicJob`s on a `JoinSet`
-with a
-`watch` shutdown; each job awaits its body inline on its own task, so overlapping runs are impossible and missed ticks
-are skipped, never bursted. Details and tokio mechanics:
+task, per-connection h2 tasks, and per-RPC handler futures. Background work is structured under the
+`BackgroundTasksManager`: periodic tickers + one dispatcher on a `JoinSet` with a `watch` shutdown; durable runs are
+version-guarded rows in the `background_task` table (retried with capped backoff, recovered at boot), gated so
+same-kind runs never overlap or pile up, and missed ticks are skipped, never bursted. Details and tokio mechanics:
 [runtime.md](runtime.md), [internals.md](internals.md) §3.
 
 ### The async→sync bridge (`AsyncStorage`) — the heart of the design

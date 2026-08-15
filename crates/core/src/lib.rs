@@ -4,6 +4,7 @@ mod issuer;
 mod listing;
 mod security;
 mod storage;
+mod task;
 mod venue;
 
 pub use common::{LoadMode, Loading, RepositoryResult, Versioned, WriteOutcome};
@@ -84,4 +85,12 @@ pub use listing::{
         ListingBuilderError, ListingRoleError, ListingStatusError, MarketSegmentError,
         RegisterListingError, TickerSymbolError,
     },
+};
+
+pub use task::repository::BackgroundTaskRepository;
+
+pub use task::{
+    BackgroundTask, BackgroundTaskBuilder, BackgroundTaskSnapshot, TaskCompletion, TaskId,
+    TaskKind, TaskStatus,
+    error::{TaskBuilderError, TaskKindError, TaskStatusError},
 };

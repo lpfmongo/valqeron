@@ -68,18 +68,21 @@ main thread          parked in block_on(run_loop)
 tokio workers        h2/protocol work, RPC handlers, timers, signal handling
   ├─ run_loop        select! over { SIGTERM, SIGINT, server task exit }
   ├─ server task     tonic serve_with_incoming_shutdown over the UDS
-  ├─ job: db_maintenance   PRAGMA optimize + passive WAL checkpoint (jittered interval)
-  └─ job: heartbeat        liveness log line
+  ├─ task tickers    db_maintenance · heartbeat · task_prune (periodic schedules)
+  └─ task dispatcher claims/executes/records rows of the background_task queue
 blocking pool        ≤ 5 storage closures (4 read + 1 write) + margin
 ```
 
-Background work is registered on a `JobSet` (`jobs.rs`): each `PeriodicJob` is one spawned task
-owning its own timer. The body is awaited inline on that task, so **overlapping runs are
-impossible by construction**; missed ticks are skipped (`MissedTickBehavior::Skip`), never
-bursted. First ticks land one full period after spawn, and the maintenance period carries ±10%
-jitter (clock sub-second noise — no RNG dependency) so periodic jobs do not synchronize with
-other periodic load. New background processes register the same way instead of growing the
-select loop.
+Background work is registered on the `BackgroundTasksManager` (`tasks.rs`): handlers by kind,
+periodic schedules on their own ticker tasks (missed ticks are skipped, never bursted; first
+ticks land one full period after spawn; ±10% optional jitter from clock sub-second noise — no
+RNG dependency). A *durable* tick enqueues a row in the `background_task` table (gated on an
+active-row check, so one kind never piles up or overlaps); the dispatcher claims due rows in
+version-guarded batches, executes them with bounded concurrency, and records the outcome —
+retrying failures with capped exponential backoff and recovering rows left `RUNNING` by a
+previous process at boot. *Ephemeral* ticks (the heartbeat) run inline and persist nothing.
+New background work registers a handler + schedule (or enqueues one-shot rows) instead of
+growing the select loop.
 
 ## The async→sync bridge: storage lanes (`storage.rs`)
 
@@ -139,7 +142,8 @@ cancel-safe (a dropped waiter simply leaves the queue).
 ```
 signal (SIGTERM/SIGINT)
   └─ STOPPING=1; stop accepting; drain in-flight RPCs        ≤ 10s  (2nd signal → exit 1)
-      └─ drain periodic jobs (tickers stop; bodies finish)    ≤ 10s
+      └─ drain background tasks (tickers + dispatcher stop;   ≤ 10s
+         in-flight runs finish and record their outcome)
           └─ storage.close(): new calls → ShuttingDown
               └─ storage.wait_idle()                          ≤ 10s
                   └─ runtime.shutdown_timeout()               ≤ 20s  (blocking-pool backstop)

@@ -31,9 +31,9 @@
 
 mod engine;
 mod grpc;
-mod jobs;
 mod notify;
 mod storage;
+mod tasks;
 
 use std::io::IsTerminal;
 use std::path::Path;

@@ -55,7 +55,9 @@ main.rs ── no argv (any argument is a config error) + logging init: stderr
 │                 socket prep → open → bind → runtime), run_loop (serve →
 │                 signal → ordered drain), checkpoint-safe teardown, exit codes
 ├── storage.rs    AsyncStorage: the async→sync bridge (read/write lanes)
-├── jobs.rs       PeriodicJob/JobSet: background work (maintenance, heartbeat)
+├── tasks.rs      BackgroundTasksManager: handler registry, periodic schedules
+│                 (durable or ephemeral), the dispatcher over the persisted
+│                 background_task queue, retry/backoff, crash recovery
 ├── notify.rs     sd_notify READY=1/STOPPING=1 (no-op without $NOTIFY_SOCKET)
 └── grpc/
     ├── issuer.rs IssuerService: register/get/list/patch/delete (unary)
@@ -128,16 +130,22 @@ chmod socket `0600` → build `multi_thread` runtime (named threads, blocking po
 `READY=1` — the socket file's existence still proves the database is open and migrated, because the bind follows the
 open.
 
-Steady state: a `select!` over SIGTERM/SIGINT/unexpected server exit, plus two `PeriodicJob`s on their own tasks
-(`jobs.rs`): `db_maintenance` on a jittered (±10%) interval (`PRAGMA optimize` + passive WAL checkpoint, routed
-through `AsyncStorage::maintenance` on the write lane; bodies await inline, so runs never overlap and missed ticks are
-skipped) and a heartbeat log line.
+Steady state: `run_loop` is a pure watcher — a `select!` over SIGTERM/SIGINT/unexpected server exit — while background
+work runs under the `BackgroundTasksManager` (`tasks.rs`). The manager owns a handler registry (`kind → handler`),
+periodic schedules (±10% optional jitter, missed ticks skipped), and a dispatcher over the **persisted queue** in the
+`background_task` table: durable runs are enqueued as rows, claimed in batches (version-guarded), executed with bounded
+concurrency, and recorded with attempts/timings/`last_error` — failed runs retry with capped exponential backoff up to
+their attempt budget, and rows found `RUNNING` at boot are recovered (requeued or failed). Built-ins: `db_maintenance`
+(durable; `PRAGMA optimize` + passive WAL checkpoint through `AsyncStorage::maintenance`), `task_prune` (durable; daily,
+deletes terminal rows older than 7 days), and the `heartbeat` (ephemeral — a log line leaves no rows). Durable enqueues
+are gated on an active-row check, so one kind never piles up or runs overlapped.
 
 Shutdown (order matters — the final checkpoint must not race in-flight writes):
 
 1. Signal → sd_notify `STOPPING=1` → stop accepting, drain in-flight RPCs (tonic graceful shutdown, ≤10s; second
    signal forces exit 1).
-2. Drain periodic jobs — tickers stop, in-flight bodies finish (≤10s).
+2. Drain background tasks — tickers and the dispatcher stop, in-flight runs finish and record their outcome (≤10s; a
+   run cut off here is exactly the crash-recovery case at next boot).
 3. `storage.close()` → new calls rejected; wait idle (≤10s).
 4. Runtime `shutdown_timeout` (≤20s) — service-manager SIGKILL is the final backstop.
 5. Unlink socket, reclaim the engine via `Arc::try_unwrap` → drop = `PRAGMA optimize` +
@@ -219,6 +227,7 @@ configuration surface (each falls back to a platform default when unset):
 | `VALQERON_LOG_FILE` / `_LOG_LEVEL`        | CLI              | same semantics, CLI's own file                                                      |
 | `<db>.lock`                               | engine           | exclusive advisory flock = single-instance authority; PID inside is diagnostic only |
 | `valqeron.sock`                           | engine           | unlinked on clean exit; stale files removed at startup under the lock               |
+| `background_task` (table)                 | engine           | persisted task queue + execution history; pruned after 7 days (terminal rows)       |
 
 ## Service management
 

@@ -562,19 +562,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use valqeron_core::TaskStatus;
-    use valqeron_infrastructure::{DatabaseConfig, SqliteStorageEngine};
+    use valqeron_infrastructure::DatabaseConfig;
 
     fn storage() -> (tempfile::TempDir, AsyncStorage) {
         let dir = tempfile::tempdir().expect("create temp dir for test database");
-        let engine = SqliteStorageEngine::open(
+        let storage = AsyncStorage::open(
             dir.path().join("tasks.db"),
             DatabaseConfig {
                 reader_pool_size: 2,
                 ..DatabaseConfig::default()
             },
         )
-        .expect("open temp engine");
-        (dir, AsyncStorage::new(engine))
+        .expect("open temp storage");
+        (dir, storage)
     }
 
     async fn recent_tasks(storage: &AsyncStorage) -> Vec<Versioned<BackgroundTask>> {

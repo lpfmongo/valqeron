@@ -31,12 +31,13 @@
 //! which [`AsyncStorage::into_engine`] can reclaim the engine for a
 //! deterministic final WAL checkpoint (`Drop`).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use valqeron_core::{Repositories, StorageEngine, StorageError};
-use valqeron_infrastructure::SqliteStorageEngine;
+use valqeron_infrastructure::{DatabaseConfig, SqliteStorageEngine};
 
 /// How long a caller may wait for an execution slot before the engine reports backpressure. Mirrors
 /// the spirit of the storage layer's own 15s progress-handler timeout while failing faster at the
@@ -76,12 +77,22 @@ pub struct AsyncStorage {
 const WRITE_SLOTS: usize = 1;
 
 impl AsyncStorage {
+    /// The single construction path in the engine: open the database
+    /// (pragmas + migrations run inside `SqliteStorageEngine::open`, before
+    /// any reader exists) and wrap it in the lane-bounded facade in one
+    /// step — a raw, ungoverned engine handle never exists outside this
+    /// module; the only way it leaves again is [`AsyncStorage::into_engine`]
+    /// for the final checkpoint.
+    pub fn open(path: impl AsRef<Path>, config: DatabaseConfig) -> Result<Self, StorageError> {
+        Ok(Self::new(SqliteStorageEngine::open(path, config)?))
+    }
+
     /// Wrap an opened engine. Lane sizing is derived, not configured: the
     /// read lane takes exactly [`SqliteStorageEngine::reader_pool_size`]
     /// permits (more would only queue on the pool's own `Condvar`, fewer
     /// would idle readers) and the write lane mirrors the single writer —
     /// a permits/pool mismatch is unrepresentable by construction.
-    pub fn new(engine: SqliteStorageEngine) -> Self {
+    fn new(engine: SqliteStorageEngine) -> Self {
         let read_slots = engine.reader_pool_size();
         Self {
             engine: Arc::new(engine),
@@ -262,15 +273,15 @@ mod tests {
     /// pool automatically, so tests shape concurrency through the pool size.
     fn storage(reader_pool_size: usize) -> (tempfile::TempDir, AsyncStorage) {
         let dir = tempfile::tempdir().expect("create temp dir for test database");
-        let engine = SqliteStorageEngine::open(
+        let storage = AsyncStorage::open(
             dir.path().join("test.db"),
             DatabaseConfig {
                 reader_pool_size,
                 ..DatabaseConfig::default()
             },
         )
-        .expect("open temp file-backed engine");
-        (dir, AsyncStorage::new(engine))
+        .expect("open temp file-backed storage");
+        (dir, storage)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

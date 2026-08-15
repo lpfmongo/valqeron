@@ -335,6 +335,31 @@ Make the sharpest bug classes **unrepresentable rather than discouraged**:
   network database); that would be a new backend crate behind the same evaluation, not an
   asyncification of this one.
 
+### Related decision: the async→sync crossing lives in the engine, not in infrastructure
+
+"Why isn't `AsyncStorage` part of `valqeron-infrastructure`, next to the pool it guards?" Four
+reasons, in order of weight:
+
+1. **Verifiability.** Infrastructure's entire sync core (`Arc`/`Condvar`/`Mutex`) is swapped
+   for loom models under `--cfg loom`; the pool's guarantees are *model-checked*. Loom cannot
+   model tokio primitives — an async facade inside that crate would be the one concurrency
+   structure the checker cannot see.
+2. **Containment.** `just deps-check` denies tokio/tonic in core and infrastructure.
+   `AsyncStorage` is tokio through and through (`Semaphore` lanes, `spawn_blocking`,
+   `timeout`); moving it moves tokio in, and the invariant dies by definition.
+3. **Runtime ownership.** `spawn_blocking` runs on the *engine's* runtime. A facade in
+   infrastructure would panic unless called from inside some tokio context — an invisible
+   dependency worse than the explicit layering.
+4. **Policy vs mechanism.** Queue timeout, `Overloaded`/`ShuttingDown` and their gRPC-code
+   mapping, close/drain/reclaim-for-checkpoint are the engine's admission and shutdown
+   *contract*; infrastructure's contract is "1 writer + N readers, safely".
+
+The two layers still compose as sealed builders: infrastructure's `Database`/`DbHandle`/
+`ReaderPool`/guards are all `pub(crate)` — its only public surface is
+`SqliteStorageEngine::open` (pragmas + migrations) plus handle accessors — and in the engine,
+`AsyncStorage::open` is the single construction path, so an ungoverned engine handle never
+exists outside `storage.rs` (it leaves only via `into_engine` for the final checkpoint).
+
 ### Related decision: service registration moved out of the binary
 
 `install`/`uninstall`/`status` subcommands were originally kept in-binary; that decision was

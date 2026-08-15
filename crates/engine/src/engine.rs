@@ -526,8 +526,12 @@ struct SocketReady<'c> {
 }
 
 impl<'c> SocketReady<'c> {
-    /// Open the database (migrations run here, before any reader exists) and
-    /// wrap it in the lane-bounded storage facade.
+    /// Open the database (migrations run here, before any reader exists)
+    /// already wrapped in the lane-bounded storage facade —
+    /// [`AsyncStorage::open`] is the engine's single construction path, so
+    /// an ungoverned engine handle never exists in this module. Lane sizing
+    /// is derived from the actual reader pool: permits ≡ connections by
+    /// construction.
     fn open_database(self) -> EngineResult<DatabaseOpen<'c>> {
         let db_config = DatabaseConfig {
             reader_pool_size: READER_POOL_SIZE,
@@ -535,16 +539,13 @@ impl<'c> SocketReady<'c> {
             ..DatabaseConfig::default()
         };
 
-        let engine = SqliteStorageEngine::open(self.config.db_path(), db_config)?;
+        let storage = AsyncStorage::open(self.config.db_path(), db_config)?;
 
         tracing::info!(
             db_path = %self.config.db_path().display(),
             "database open; migrations applied"
         );
 
-        // Lane sizing is derived from the engine's actual reader pool inside
-        // AsyncStorage::new — permits ≡ connections by construction.
-        let storage = AsyncStorage::new(engine);
         Ok(DatabaseOpen {
             config: self.config,
             lock: self.lock,

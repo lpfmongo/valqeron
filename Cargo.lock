@@ -2190,9 +2190,6 @@ dependencies = [
 [[package]]
 name = "valqeron-common"
 version = "0.1.0"
-dependencies = [
- "serde_json",
-]
 
 [[package]]
 name = "valqeron-core"
@@ -2211,7 +2208,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "directories",
- "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

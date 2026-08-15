@@ -18,11 +18,11 @@ use valqeron_core::{Issuer, IssuerId, IssuerPatch, Versioned, WriteOutcome};
 use valqeron_proto::v1::rpc_admin_service_client::RpcAdminServiceClient;
 use valqeron_proto::v1::rpc_issuer_service_client::RpcIssuerServiceClient;
 use valqeron_proto::{
-    PROTOCOL_VERSION, issuer_from_proto, issuer_to_register_request, problem_from_status,
-    resolve_socket_path, v1, write_outcome_from_proto,
+    PROTOCOL_VERSION, issuer_from_proto, issuer_to_register_request, resolve_socket_path, v1,
+    write_outcome_from_proto,
 };
 
-pub use error::{ClientError, EngineProblem};
+pub use error::ClientError;
 use v1::{
     DeleteIssuerRequestProto, GetIssuerRequestProto, HealthRequestProto, ListIssuersRequestProto,
     PatchIssuerRequestProto, StatusRequestProto,
@@ -305,12 +305,10 @@ impl Client {
         write_outcome_from_proto(&outcome).map_err(|e| ClientError::InvalidResponse(e.to_string()))
     }
 
-    /// gRPC status → typed error: decode the RFC-7807 problem when present,
-    /// classify transport-level failures otherwise.
+    /// gRPC status → typed error: transport-level unavailability keeps its
+    /// dedicated variant; everything else surfaces as the engine's own
+    /// code + message.
     fn map_status(&self, status: tonic::Status) -> ClientError {
-        if let Some(detail) = problem_from_status(&status) {
-            return ClientError::Problem(Box::new(EngineProblem::from(detail)));
-        }
         match status.code() {
             tonic::Code::Unavailable => ClientError::Unreachable {
                 socket: self.socket.clone(),

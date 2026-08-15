@@ -103,6 +103,9 @@ fn engine_command(db: &Path) -> Command {
         .env_remove("VALQERON_ENGINE_DURABLE")
         .env_remove("VALQERON_ENGINE_MAINTENANCE_INTERVAL")
         .env_remove("VALQERON_ENGINE_HEARTBEAT_INTERVAL")
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("WATCHDOG_USEC")
+        .env_remove("WATCHDOG_PID")
         .env("VALQERON_DB", db)
         // Isolate the gRPC socket per test: parallel tests must never
         // contend on (or clean up) the shared default socket path.
@@ -266,6 +269,57 @@ fn starts_heartbeats_and_shuts_down_cleanly_on_sigterm() {
         .map(|m| m.len())
         .unwrap_or(0);
     assert_eq!(wal, 0, "WAL must be truncated after a clean shutdown");
+}
+
+/// Receive datagrams until `want` arrives, skipping others (watchdog pings
+/// interleave freely with state announcements).
+fn recv_until(receiver: &std::os::unix::net::UnixDatagram, want: &str) {
+    let mut seen = Vec::new();
+    loop {
+        let mut buf = [0u8; 64];
+        let received = receiver
+            .recv(&mut buf)
+            .unwrap_or_else(|e| panic!("waiting for {want:?}, got {seen:?}, then: {e}"));
+        let datagram = String::from_utf8_lossy(buf.get(..received).unwrap_or_default()).to_string();
+        if datagram == want {
+            return;
+        }
+        seen.push(datagram);
+    }
+}
+
+/// End-to-end sd_notify protocol against a fake NOTIFY_SOCKET: readiness,
+/// watchdog pings at half the advertised interval, and the stopping
+/// announcement — no systemd required.
+#[test]
+fn sd_notify_reports_ready_watchdog_pings_and_stopping() {
+    let (_dir, db) = temp_db();
+    let notify_dir = tempfile::tempdir().expect("tempdir");
+    let notify_path = notify_dir.path().join("notify.sock");
+    let receiver =
+        std::os::unix::net::UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    receiver
+        .set_read_timeout(Some(STARTUP_TIMEOUT))
+        .expect("read timeout");
+
+    let notify_socket = notify_path.to_str().expect("utf-8 path").to_string();
+    let mut engine = spawn_engine_with(
+        &db,
+        "3600",
+        "3600",
+        &[
+            ("NOTIFY_SOCKET", notify_socket.as_str()),
+            // 1s watchdog → WATCHDOG=1 every 500ms.
+            ("WATCHDOG_USEC", "1000000"),
+        ],
+    );
+
+    recv_until(&receiver, "READY=1");
+    recv_until(&receiver, "WATCHDOG=1");
+
+    engine.signal("-TERM");
+    recv_until(&receiver, "STOPPING=1");
+    assert_eq!(engine.wait_exit(), Some(0), "clean exit after the protocol");
 }
 
 #[test]

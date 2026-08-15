@@ -10,9 +10,9 @@ function without a running engine.
 
 ```mermaid
 graph LR
-    CLI["valqeron-cli<br/>binary valqeron / vq<br/>clap · JSON envelope · RFC-7807"]
+    CLI["valqeron-cli<br/>binary valqeron / vq<br/>clap · JSON envelope · anyhow"]
     CLIENT["valqeron-client<br/>blocking facade<br/>internal current_thread runtime"]
-    PROTO["valqeron-proto<br/>.proto contract · protox codegen<br/>mapping · socket discovery · ProblemDetail codec"]
+    PROTO["valqeron-proto<br/>.proto contract · protox codegen<br/>mapping · socket discovery"]
     ENGINE["valqeron-engine<br/>daemon · multi_thread tokio<br/>gRPC over UDS"]
     INFRA["valqeron-infrastructure<br/>SQLite: single writer + reader pool<br/>WAL · embedded migrations (loom-verified)"]
     CORE["valqeron-core<br/>domain + ports · sync · no I/O"]
@@ -35,7 +35,7 @@ graph LR
 | `valqeron-core`           | Aggregates (`Issuer`, `Security`, `Listing`, `Venue`) + blocking ports (`*Repository`, `StorageEngine`).                                                                                                    | no — enforced by `just deps-check`   |
 | `valqeron-identifiers`    | Fully validated identifier types; invalid state unrepresentable.                                                                                                                                            | no                                   |
 | `valqeron-infrastructure` | SQLite adapter: one writer behind a `Mutex`, `Condvar` reader pool, WAL, compile-time-embedded migrations. **Private to the engine** — no other crate may depend on it.                                     | no — enforced                        |
-| `valqeron-proto`          | Single wire-contract source of truth: `.proto` files, generated tonic types (lint-quarantined), fallible domain⇄proto mapping, socket discovery, `ProblemDetailProto`⇄`tonic::Status` codec, `PROTOCOL_VERSION`. | types only, no runtime               |
+| `valqeron-proto`          | Single wire-contract source of truth: `.proto` files, generated tonic types (lint-quarantined), fallible domain⇄proto mapping, socket discovery, `PROTOCOL_VERSION`. | types only, no runtime               |
 | `valqeron-client`         | Blocking client: connect + handshake, typed errors, returns domain types. No clap, no stdout.                                                                                                               | hides a `current_thread` runtime     |
 | `valqeron-cli`            | Thin client binary. Local pre-validation for UX; the engine is authoritative.                                                                                                                               | no async code; tokio only transitive |
 | `valqeron-engine`         | This daemon.                                                                                                                                                                                                | `multi_thread` tokio at the edge     |
@@ -61,11 +61,13 @@ main.rs ── no argv (any argument is a config error) + logging init: stderr
 ├── tasks.rs      BackgroundTasksManager: handler registry, periodic schedules
 │                 (durable or ephemeral), the dispatcher over the persisted
 │                 background_task queue, retry/backoff, crash recovery
-├── notify.rs     sd_notify READY=1/STOPPING=1 (no-op without $NOTIFY_SOCKET)
+├── notify.rs     sd_notify READY=1/STOPPING=1/WATCHDOG=1, non-blocking
+│                 datagrams (no-op without $NOTIFY_SOCKET); watchdog gate
+│                 reads WATCHDOG_USEC/_PID
 └── grpc/
     ├── issuer.rs IssuerService: register/get/list/patch/delete (unary)
     ├── admin.rs  AdminService: health (handshake), status
-    └── problem.rs error → (tonic::Code, RFC-7807 ProblemDetail)
+    └── error.rs  HandlerError → tonic::Status (code + domain message)
 ```
 
 Service registration (launchd/systemd) is **not** part of the binary: installation and upgrade
@@ -89,7 +91,7 @@ sequenceDiagram
     AS ->> SQL: spawn_blocking: whole domain op in one closure
     SQL -->> AS: result (writer mutex / reader pool as designed)
     AS -->> SVC: Result<T, HandlerError>
-    SVC -->> CL: Response | Status + ProblemDetail (details bytes)
+    SVC -->> CL: Response | Status (code + message)
     CL -->> CLI: domain type | typed ClientError
 ```
 
@@ -199,27 +201,28 @@ launchd/systemd restart policies key off these.
 
 ## Error contract
 
-Engine failures map to exactly one `(tonic::Code, ProblemDetail)` pair; the RFC-7807 document travels prost-encoded in
-the `Status` details. The client decodes it and the CLI renders it verbatim — `status` doubles as the CLI exit code.
-Slugs are a compatibility contract; renaming one is a breaking change.
+Engine failures travel as a plain `tonic::Status`: one gRPC code plus the domain error's own `thiserror` message
+(`grpc/error.rs` — a single `HandlerError` with one `code()` mapping). Protocol v2 removed the former RFC-7807
+problem envelope (slugs, sysexits statuses, JSON extensions): nothing consumed it — the CLI prints the message and
+exits 1, and the messages already carry the information. The human message text is best-effort, not ABI; the codes are
+the machine contract:
 
-| Slug (examples)                                                    | Status/exit | gRPC code           |
-|--------------------------------------------------------------------|-------------|---------------------|
-| `issuer/validation/*`, `identifier/*-invalid`, `issuer/invalid-id` | 65          | `InvalidArgument`   |
-| `issuer/duplicate-cnpj`, `issuer/duplicate-lei`                    | 9           | `AlreadyExists`     |
-| `storage/failed`                                                   | 80          | `Internal`          |
-| `engine/overloaded`                                                | 75          | `ResourceExhausted` |
-| `engine/unavailable`                                               | 69          | `Unavailable`       |
-| `engine/not-running`, `engine/unreachable` (client-side, no RPC)   | 69          | —                   |
-| `engine/version-mismatch` (client-side)                            | 78          | —                   |
+| Failure class                                        | gRPC code           |
+|-------------------------------------------------------|---------------------|
+| proto→domain mapping / validation                     | `InvalidArgument`   |
+| duplicate CNPJ / LEI                                  | `AlreadyExists`     |
+| storage faults, internal errors                       | `Internal`          |
+| backpressure (`engine is overloaded`)                 | `ResourceExhausted` |
+| shutting down                                         | `Unavailable`       |
+| not running / unreachable / version mismatch          | client-side typed `ClientError` variants (no RPC) |
 
 ## Client (`valqeron-client`)
 
 Blocking by design: callers stay synchronous; a per-`Client` `current_thread` runtime drives tonic inside `block_on` (do
 not call it from within another runtime). Connect: resolve socket → missing file is an immediate, matchable
 `NotRunning` → bounded connect (2s default) over a UDS connector → `Health` handshake. Per-RPC timeout 30s default.
-Mutations are **never** retried. Engine problems surface as `ClientError::Problem(EngineProblem)`; transport failures
-classify into `NotRunning`/`Unreachable`/`Rpc`.
+Mutations are **never** retried. Engine rejections surface as `ClientError::Rpc { code, message }`; transport failures
+classify into `NotRunning`/`Unreachable`.
 
 ## Concurrency & sizing
 
@@ -276,13 +279,13 @@ machine-local file under `scripts/install/` stays.
 
 Runtime diagnostics live in the client: `valqeron engine ping` (health/version handshake round-trip) and
 `valqeron engine status` (engine version, protocol version, db path, uptime, pid) probe a *running* engine over the
-socket; a stopped engine surfaces as the typed `engine/not-running` problem.
+socket; a stopped engine surfaces as the typed `ClientError::NotRunning`.
 
 ## Extending
 
 - **New RPC on an existing entity:** extend the `.proto`, add mapping (+ round-trip/negative tests), implement the
   handler as one `AsyncStorage::read`/`write` closure, map errors in
-  `grpc/problem.rs`, expose a typed client method. Additive fields keep `PROTOCOL_VERSION`.
+  `grpc/error.rs`, expose a typed client method. Additive fields keep `PROTOCOL_VERSION`.
 - **New entity (venue/listing):** SQLite adapter in `infrastructure` (`mapping/model/queries/
   repository` layout), wire into `Repositories`, then the steps above.
 - **Streaming/events (future):** add a server-streaming service in proto; emit change events at the `AsyncStorage`

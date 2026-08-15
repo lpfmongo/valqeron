@@ -28,6 +28,10 @@ KillSignal=SIGTERM
 # Must exceed the engine's internal drain (10s) + runtime shutdown (20s)
 # bounds so a graceful stop is never truncated mid-checkpoint.
 TimeoutStopSec=60
+# Optional hang detection: the engine pings WATCHDOG=1 at half this interval;
+# systemd SIGABRTs + restarts it when pings stop. Keep it comfortably above
+# the graceful-stop budget (pings stop while the shutdown drain runs).
+# WatchdogSec=90
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

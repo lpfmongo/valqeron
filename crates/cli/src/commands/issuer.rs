@@ -163,7 +163,7 @@ impl Command for RegisterArgs {
         );
 
         // Validate locally for instant feedback; the engine re-validates
-        // authoritatively (its problems carry the same taxonomy).
+        // authoritatively (its errors carry the same domain messages).
         let issuer = input.into_issuer()?;
 
         let registered = client.register_issuer(&issuer, ctx.dry_run())?;

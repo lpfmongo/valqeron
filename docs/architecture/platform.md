@@ -17,7 +17,7 @@ and [internals.md](internals.md) (thread inventory, tokio mechanics, decision re
 ┌──────────────────────────────────────────────────────┐   ┌──────────────────────────────────┐
 │  valqeron / vq  (crates/cli)                         │   │ launchd (macOS) │ systemd --user │
 │  clap · pre-validation (UX only) · JSON envelope     │   │   LaunchAgent   │  Type=notify   │
-│  RFC-7807 rendering · problem.status = exit code     │   │   RunAtLoad     │  READY=1 ◄──┐  │
+│  anyhow errors · message printed · exit 1 on failure │   │   RunAtLoad     │  READY=1 ◄──┐  │
 └──────────────────────┬───────────────────────────────┘   │   KeepAlive     │  STOPPING=1 │  │
                        │ blocking calls                    └──────────┬────────────────────┼──┘
 ┌──────────────────────▼───────────────────────────────┐              │ spawns the engine  │
@@ -32,7 +32,7 @@ and [internals.md](internals.md) (thread inventory, tokio mechanics, decision re
      valqeron-proto (crates/proto)                                    │
      .proto (protox codegen) · domain⇄proto fallible mapping          │
      socket discovery (shared: flag > VALQERON_SOCKET > platform)     │
-     ProblemDetail⇄Status codec · slugs are ABI                       │
+     errors = plain Status (gRPC code + domain message)               │
      ══════════════════╤═══════════════════════════════════════════   │
                        │  gRPC / HTTP2                                │
                        ▼                                              │
@@ -107,7 +107,7 @@ The three `══` double lines are the boundaries where rules live; everything 
 | Boundary                                 | What crosses it                  | The rule                                                                                                              |
 |------------------------------------------|----------------------------------|-----------------------------------------------------------------------------------------------------------------------|
 | **UDS socket** (process boundary)        | gRPC/HTTP2 frames                | one engine owns the database; every other process is a client. The socket file doubles as a truthful readiness signal |
-| **Wire contract** (`valqeron-proto`)     | proto messages, problem details  | compatibility surface: `PROTOCOL_VERSION` handshake, problem slugs are ABI, IDs/timestamps have fixed canonical forms |
+| **Wire contract** (`valqeron-proto`)     | proto messages, status codes     | compatibility surface: `PROTOCOL_VERSION` handshake, gRPC codes are the machine contract, IDs/timestamps have fixed canonical forms |
 | **Async/sync frontier** (`AsyncStorage`) | one closure per domain operation | the only place async and blocking code meet; admission is lane-bounded to mirror the SQLite resources exactly         |
 
 Arrows follow one request end to end: CLI → client `block_on` → UDS/h2 → handler (proto→domain parse) → lane permit →
@@ -119,9 +119,9 @@ omitted from the map; it sits beside proto with no architecturally interesting e
 ### Client process: `valqeron` / `vq` (crates/cli)
 
 A thin, short-lived binary. It pre-validates input purely for UX (fast feedback, nice messages) — **the engine is
-authoritative** and re-validates everything. Output is a JSON envelope or human text; engine failures arrive as RFC-7807
-problem documents and are rendered verbatim, with `problem.status` doubling as the process exit code so scripts can
-branch on failure *class*. The CLI contains no database code and cannot function without a running engine.
+authoritative** and re-validates everything. Output is a JSON envelope or human text; errors flow as `anyhow`, are
+printed as their message (for engine rejections: the gRPC code + the domain error's own text), and the process exits 1
+on any failure. The CLI contains no database code and cannot function without a running engine.
 
 ### `valqeron-client` — the blocking facade (crates/client)
 
@@ -138,10 +138,10 @@ Callers stay synchronous; each `Client` owns a private `current_thread` tokio ru
 ### The wire contract (crates/proto)
 
 The single source of truth both sides compile against: `.proto` files (built by `protox`, no system `protoc`), fallible
-domain⇄proto mapping (invalid wire data cannot become a domain value), the `ProblemDetail`⇄`tonic::Status` codec, and —
-deliberately — **socket discovery**, because engine and clients must resolve the same path (flag > `VALQERON_SOCKET` >
-platform runtime dir). Renaming a problem slug or changing a canonical form is a breaking change; bump
-`PROTOCOL_VERSION`.
+domain⇄proto mapping (invalid wire data cannot become a domain value), and — deliberately — **socket discovery**,
+because engine and clients must resolve the same path (flag > `VALQERON_SOCKET` > platform runtime dir). Errors travel
+as plain gRPC statuses (protocol v2 dropped the RFC-7807 details payload); changing a gRPC code mapping or a canonical
+form is a breaking change; bump `PROTOCOL_VERSION`.
 
 ### Service manager (launchd / systemd --user)
 

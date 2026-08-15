@@ -97,17 +97,9 @@ message WriteOutcomeProto {
   }
 }
 
-// RFC-7807 problem document. Carried in the gRPC status details so clients can render the same error envelope a direct
-// CLI run would produce.
-message ProblemDetailProto {
-  string type = 1;
-  string title = 2;
-  uint32 status = 3;
-  string detail = 4;
-  // JSON object with problem-specific extension members ("{}" when empty).
-  string extensions_json = 5;
-  repeated string causes = 6;
-}
+// Errors travel as plain gRPC statuses: a tonic code plus the engine error's
+// human-readable message. (Protocol v2 removed the former RFC-7807
+// ProblemDetailProto status-details payload — nothing consumed it.)
 
 message HealthRequestProto {}
 

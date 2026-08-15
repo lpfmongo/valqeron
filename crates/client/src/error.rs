@@ -1,39 +1,4 @@
 use std::path::PathBuf;
-use v1::ProblemDetailProto;
-use valqeron_proto::v1;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineProblem {
-    pub problem_type: String,
-    pub title: String,
-    pub status: u32,
-    pub detail: String,
-    pub extensions_json: String,
-    pub causes: Vec<String>,
-}
-
-impl From<ProblemDetailProto> for EngineProblem {
-    fn from(p: ProblemDetailProto) -> Self {
-        Self {
-            problem_type: p.r#type,
-            title: p.title,
-            status: p.status,
-            detail: p.detail,
-            extensions_json: p.extensions_json,
-            causes: p.causes,
-        }
-    }
-}
-
-impl std::fmt::Display for EngineProblem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.detail.is_empty() {
-            f.write_str(&self.title)
-        } else {
-            write!(f, "{}: {}", self.title, self.detail)
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -57,9 +22,8 @@ pub enum ClientError {
         engine_version: String,
     },
 
-    #[error("{0}")]
-    Problem(Box<EngineProblem>),
-
+    /// The engine rejected the call: a gRPC code plus the engine error's own
+    /// human-readable message (the whole error contract since protocol v2).
     #[error("rpc failed ({code}): {message}")]
     Rpc { code: String, message: String },
 
@@ -74,13 +38,6 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    pub fn problem(&self) -> Option<&EngineProblem> {
-        match self {
-            ClientError::Problem(p) => Some(p.as_ref()),
-            _ => None,
-        }
-    }
-
     pub fn is_not_running(&self) -> bool {
         matches!(self, ClientError::NotRunning { .. })
     }

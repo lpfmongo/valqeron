@@ -831,10 +831,11 @@ impl GrpcServer {
 
 // ================ BACKGROUND TASK REGISTRATIONS ================
 /// Task kinds the engine registers — also the `kind` values persisted in the
-/// `background_task` table.
+/// `background_task` table (the ephemeral kinds never persist).
 const DB_MAINTENANCE_TASK: &str = "db_maintenance";
 const HEARTBEAT_TASK: &str = "heartbeat";
 const TASK_PRUNE_TASK: &str = "task_prune";
+const SD_WATCHDOG_TASK: &str = "sd_watchdog";
 
 /// How long terminal task rows are kept before `task_prune` deletes them.
 const TASK_RETENTION_DAYS: i64 = 7;
@@ -844,14 +845,14 @@ const TASK_PRUNE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The engine's built-in background work, as one registry + schedule set:
 /// `db_maintenance` and `task_prune` leave durable history rows in
-/// `background_task`; the heartbeat is a pure liveness log line (ephemeral)
-/// reporting the observed lifecycle state.
+/// `background_task`; the heartbeat (a liveness log line reporting the
+/// observed lifecycle state) and the systemd watchdog ping are ephemeral.
 fn background_tasks(
     config: &EngineConfig,
     started: Instant,
     state: watch::Receiver<LifecycleState>,
 ) -> BackgroundTasksBuilder {
-    BackgroundTasksManager::builder()
+    let builder = BackgroundTasksManager::builder()
         .handler(DB_MAINTENANCE_TASK, |ctx| async move {
             match ctx
                 .storage
@@ -924,6 +925,30 @@ fn background_tasks(
             period: TASK_PRUNE_PERIOD,
             jitter: true,
             tracking: Tracking::Durable,
+        });
+
+    // Under a systemd watchdog (WatchdogSec= in the unit), ping WATCHDOG=1
+    // at half the configured interval so a hung engine — not just a dead
+    // one — gets detected and restarted. No-op everywhere else.
+    let Some(interval) = crate::notify::watchdog_interval() else {
+        return builder;
+    };
+    let period = interval.checked_div(2).unwrap_or(interval);
+    tracing::info!(
+        interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+        ping_every_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX),
+        "systemd watchdog armed; pinging at half the interval"
+    );
+    builder
+        .handler(SD_WATCHDOG_TASK, |_ctx| async {
+            crate::notify::notify_watchdog();
+            Ok(())
+        })
+        .periodic(PeriodicSpec {
+            kind: SD_WATCHDOG_TASK,
+            period,
+            jitter: false,
+            tracking: Tracking::Ephemeral,
         })
 }
 

@@ -176,8 +176,8 @@ existence.
  5 admit    storage.write("issuer.register", dry_run, closure)
      5a     write-lane semaphore (1 permit), FIFO, acquired asynchronously —
             waiting costs a suspended future, no thread
-     5b     5s timeout → Overloaded → ResourceExhausted (engine/overloaded)
-            lane closed → ShuttingDown → Unavailable   (engine/unavailable)
+     5b     5s timeout → Overloaded → ResourceExhausted
+            lane closed → ShuttingDown → Unavailable
  6 execute  spawn_blocking closure                                     [blocking-pool thread]
      6a     dry_run=false: f(&engine.repositories())
             dry_run=true : engine.dry_run(f)   ← same closure, savepoint scope
@@ -185,10 +185,10 @@ existence.
             = the WHOLE domain op: uniqueness checks (CNPJ, LEI) + insert, atomic
               within one closure execution — no interleaving possible
  7 result   permit released; handler's JoinHandle resolves             [worker]
- 8 respond  Ok(proto) — or HandlerError → into_status(): exactly one
-            (tonic::Code, RFC-7807 ProblemDetail) pair, prost-encoded in Status details
- 9 client   decodes the problem → ClientError::Problem; problem.status doubles as
-            the CLI exit code
+ 8 respond  Ok(proto) — or HandlerError → into_status(): one tonic::Code +
+            the domain error's thiserror message (plain Status, no payload)
+ 9 client   classifies the status → ClientError::Rpc { code, message };
+            the CLI prints the message and exits 1
 ```
 
 Reads (`get`, `list`) take the read lane (`storage.read`, 4 permits); a saturated writer never
@@ -372,7 +372,7 @@ service-manager one.
 | 13 | A panic never leaks a half-open transaction | `lock_writer` poison recovery forces `ROLLBACK` on non-autocommit connections |
 | 14 | No operation pins a connection unboundedly | progress-handler watchdog: 15 s → `SQLITE_INTERRUPT`, armed/cleared by guard RAII |
 | 15 | Pool never loses or duplicates a connection; blocked `take` is always woken | loom model checks (`just test-loom`); `PooledReader` check-in on `Drop` |
-| 16 | Wire compatibility: `PROTOCOL_VERSION` handshake; problem slugs stable | client refuses on mismatch; slugs (e.g. `issuer/duplicate-cnpj`) are a named compatibility contract |
+| 16 | Wire compatibility: `PROTOCOL_VERSION` handshake (v2: plain-Status errors) | client refuses on mismatch; error contract = gRPC code + message, codes are the machine surface |
 | 17 | Mutations are never retried by the client | client design; "response lost after commit" surfaces honestly |
 | 18 | Background jobs never overlap and never burst | job body awaited inline on its own task; `MissedTickBehavior::Skip` |
 
@@ -383,8 +383,8 @@ service-manager one.
 | Pool correctness under contention | loom (`#[cfg(loom)]` primitives swap, `just test-loom`) |
 | Lane semantics: typed backpressure, reads survive writer saturation, cancel safety, drain | `storage.rs` unit tests (2-worker runtimes vs 16 calls, blocked-lane probes) |
 | Boot order, exit codes, lock/socket cleanup, WAL truncated on clean exit | `tests/lifecycle.rs` — black-box against the real binary |
-| Full client path: lifecycle, dry-run persistence, problem taxonomy, reader-pool fan-out | `tests/grpc.rs` — real binary + real `valqeron-client` over UDS |
+| Full client path: lifecycle, dry-run persistence, typed error codes, reader-pool fan-out | `tests/grpc.rs` — real binary + real `valqeron-client` over UDS |
 | Dry-run vs concurrent writers; mixed read/write soak | `#[ignore]` stress tests (`cargo test -- --ignored`) |
 | Fallibility discipline (no unwrap/panic/indexing/unchecked arithmetic) | workspace `deny` lints |
 | Async containment | `just deps-check` |
-| sd_notify datagrams (`READY=1`/`STOPPING=1`) | unit tests + local live check; systemd `Type=notify` end-to-end remains on the manual Linux checklist |
+| sd_notify protocol (`READY=1`/`WATCHDOG=1`/`STOPPING=1`) | unit tests + fake-`NOTIFY_SOCKET` e2e in `tests/lifecycle.rs`; real systemd `Type=notify`/`WatchdogSec` remains on the manual Linux checklist |

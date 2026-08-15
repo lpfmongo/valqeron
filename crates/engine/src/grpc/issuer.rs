@@ -11,7 +11,7 @@ use valqeron_proto::{
     write_outcome_to_proto,
 };
 
-use crate::grpc::problem::HandlerError;
+use crate::grpc::error::HandlerError;
 use crate::storage::AsyncStorage;
 
 const DEFAULT_LIST_LIMIT: u32 = 50;

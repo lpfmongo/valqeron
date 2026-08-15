@@ -55,11 +55,18 @@ pool itself (tokio's default would allow 512 blocking threads).
 ### Readiness
 
 The moment the server task is serving, the engine emits the `engine_ready` audit event and sends
-`READY=1` over `$NOTIFY_SOCKET` (`notify.rs` — hand-rolled sd_notify, ~40 lines over
-`std::os::unix::net::UnixDatagram`, silent no-op when the variable is unset). When shutdown
-begins it sends `STOPPING=1`. The systemd user unit is `Type=notify`, so `systemctl start`
+`READY=1` over `$NOTIFY_SOCKET` (`notify.rs` — hand-rolled sd_notify over
+`std::os::unix::net::UnixDatagram`, **non-blocking** sends so a full receiver queue can never
+stall a runtime worker, silent no-op when the variable is unset). When shutdown begins it sends
+`STOPPING=1`. Under a systemd watchdog (`WatchdogSec=`, exported as `WATCHDOG_USEC`/`_PID`) an
+ephemeral periodic task pings `WATCHDOG=1` at half the interval so a *hung* engine gets detected
+and restarted — deliberately plain std sockets, not `tokio::net::UnixDatagram`: 8-byte advisory
+fire-and-forget datagrams sent from the sync-by-design lifecycle FSM gain nothing from a
+reactor. The systemd user unit is `Type=notify`, so `systemctl start`
 returns only once the engine actually serves; launchd has no readiness concept and is
-unaffected. Tests wait on the `engine_ready` line instead of heartbeat proxies.
+unaffected. Tests wait on the `engine_ready` line instead of heartbeat proxies; the wire
+protocol itself (READY → WATCHDOG pings → STOPPING) is covered end-to-end against a fake
+`NOTIFY_SOCKET` in `tests/lifecycle.rs`.
 
 ## Steady state: tasks and threads
 

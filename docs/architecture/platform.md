@@ -20,10 +20,10 @@ and [internals.md](internals.md) (thread inventory, tokio mechanics, decision re
 │  RFC-7807 rendering · problem.status = exit code     │   │   RunAtLoad     │  READY=1 ◄──┐  │
 └──────────────────────┬───────────────────────────────┘   │   KeepAlive     │  STOPPING=1 │  │
                        │ blocking calls                    └──────────┬────────────────────┼──┘
-┌──────────────────────▼───────────────────────────────┐              │ spawns `run`       │
-│  valqeron-client  (crates/client)                    │              │ install/uninstall  │
-│  hidden current_thread runtime · block_on adapter    │              │ renders embedded   │
-│  connect(2s) → Health handshake (PROTOCOL_VERSION=1) │              │ templates          │
+┌──────────────────────▼───────────────────────────────┐              │ spawns the engine  │
+│  valqeron-client  (crates/client)                    │              │ registered by      │
+│  hidden current_thread runtime · block_on adapter    │              │ just engine-       │
+│  connect(2s) → Health handshake (PROTOCOL_VERSION=1) │              │ install/uninstall  │
 │  per-RPC 30s · mutations NEVER retried               │              │                    │
 │  missing socket file ⇒ typed NotRunning (no RPC)     │              │              notify.rs
 └──────────────────────┬───────────────────────────────┘              │              sd_notify
@@ -144,11 +144,16 @@ platform runtime dir). Renaming a problem slug or changing a canonical form is a
 
 ### Service manager (launchd / systemd --user)
 
-The engine registers *itself*: `install` renders embedded templates with the same path resolution the engine uses at
-runtime (which is exactly why registration is in-binary and not a shell script — see the decision note
-in [internals.md](internals.md)). `install --print` shows the exact definition; re-install is idempotent;
-`status --json` gives scripts a structured probe. On Linux the unit is `Type=notify`: the engine sends `READY=1` when it
-is actually serving and `STOPPING=1` when shutdown begins (`notify.rs`, hand-rolled datagram, silent no-op elsewhere).
+Registration is a *separate lifecycle* from the daemon: the binary takes no arguments (configuration is `VALQERON_*`
+env vars carried by the service definition); `just engine-install` /
+`just engine-uninstall` copy a static, machine-local service definition (LaunchAgent plist / systemd user unit created
+once from the committed `.example` under `scripts/install/`, gitignored, carrying the paths and `VALQERON_*` overrides)
+into place and register/deregister it, tearing the old instance fully down before starting the new one so at most one
+engine runs at any time — the
+development stand-in for future packaging (see the decision note in [internals.md](internals.md)). Runtime liveness is
+probed through the client (`valqeron engine ping`/`status`). On Linux the unit is `Type=notify`: the engine sends
+`READY=1` when it is actually serving and `STOPPING=1` when shutdown begins (`notify.rs`, hand-rolled datagram, silent
+no-op elsewhere).
 
 ### Engine bootstrap (typestate chain)
 

@@ -7,10 +7,7 @@ use crate::context::AppContext;
 
 #[derive(Subcommand, Debug)]
 pub enum EngineCommand {
-    /// Initialize the engine and start serving.
-    Start(StartArgs),
-
-    /// Check the engine's health.
+    /// Check the engine's health (version handshake round-trip).
     Ping(PingArgs),
 
     /// Run engine diagnostics and return its status.
@@ -22,7 +19,6 @@ impl EngineCommand {
         match self {
             EngineCommand::Ping(args) => args,
             EngineCommand::Status(args) => args,
-            EngineCommand::Start(args) => args,
         }
     }
 }
@@ -72,14 +68,5 @@ impl Command for StatusArgs {
             "pid": status.pid,
             "socket": client.socket().display().to_string(),
         }))
-    }
-}
-
-#[derive(Args, Debug)]
-pub struct StartArgs {}
-
-impl Command for StartArgs {
-    fn execute(&self, _client: &Client, _ctx: &AppContext) -> anyhow::Result<Value> {
-        let engine_config = EngineConfig::resolve()?;
     }
 }

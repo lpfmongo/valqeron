@@ -60,7 +60,7 @@ The pragma layer knows two roles — invalid combinations are unrepresentable:
 | open flags | `READ_WRITE \| CREATE` | `READ_ONLY` | readers physically cannot write |
 | `journal_mode` | set to `WAL` | read (a DB-file property; read-only conns can't set it) | concurrent readers + one writer |
 | `query_only` | — | `ON` | second, SQLite-level belt on top of the read-only open flags; a write on a reader fails with `SQLITE_READONLY` |
-| `synchronous` | `NORMAL` (default) or `FULL` | same | `NORMAL` is safe in WAL (no corruption, bounded loss on power cut); the engine's `--durable` flips to `FULL` |
+| `synchronous` | `NORMAL` (default) or `FULL` | same | `NORMAL` is safe in WAL (no corruption, bounded loss on power cut); a truthy `VALQERON_ENGINE_DURABLE` flips to `FULL` |
 | `foreign_keys` | `ON` | `ON` | FK enforcement is per-connection in SQLite |
 | `busy_timeout` | 5 s (default) | 5 s | see [Cross-process contention](#cross-process-contention) |
 | `cache_size` | −64 000 (64 000 KiB ≈ 64 MB) | same | page cache per connection |
@@ -99,7 +99,7 @@ Four locking layers, from innermost to outermost:
    invisible; they still matter across processes — see
    [Cross-process contention](#cross-process-contention).
 
-4. **Engine single-instance lock** (`crates/engine/src/lockfile.rs`, detailed in
+4. **Engine single-instance lock** (`EngineLock` in `crates/engine/src/engine.rs`, detailed in
    [engine.md](engine.md)). A kernel advisory lock (`File::try_lock`) on `<db>.lock` next to
    the database file guarantees at most one engine per database. It is *not* part of this
    layer, but it is the reason the layer may assume exclusive ownership in production
@@ -215,7 +215,7 @@ lock; see engine.md). `wal_autocheckpoint = 1000` keeps the WAL bounded between 
 | Field | Default | Production (engine) |
 |---|---|---|
 | `reader_pool_size` | `min(available_parallelism, 6)`, fallback 2 | `READER_POOL_SIZE = 4` |
-| `synchronous` | `Normal` | `Normal`, or `Full` with `--durable` |
+| `synchronous` | `Normal` | `Normal`, or `Full` with a truthy `VALQERON_ENGINE_DURABLE` |
 | `busy_timeout` | 5 s | 5 s |
 
 Sizing note: the engine's async facade admits storage closures through two lanes that mirror

@@ -94,19 +94,20 @@ impl Engine {
     }
 }
 
+/// Base invocation: the binary takes no arguments, so all configuration is
+/// injected through `VALQERON_*` env vars, with inherited ones scrubbed first.
 fn engine_command(db: &Path) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.env_remove("RUST_LOG")
-        .env_remove("VALQERON_DB")
-        .env_remove("VALQERON_SOCKET")
-        .env_remove("VALQERON_ENGINE_LOG_FILE")
         .env_remove("VALQERON_ENGINE_LOG_LEVEL")
-        .arg("--db-path")
-        .arg(db)
+        .env_remove("VALQERON_ENGINE_DURABLE")
+        .env_remove("VALQERON_ENGINE_MAINTENANCE_INTERVAL")
+        .env_remove("VALQERON_ENGINE_HEARTBEAT_INTERVAL")
+        .env("VALQERON_DB", db)
         // Isolate the gRPC socket per test: parallel tests must never
         // contend on (or clean up) the shared default socket path.
-        .arg("--socket")
-        .arg(socket_path(db));
+        .env("VALQERON_SOCKET", socket_path(db))
+        .env("VALQERON_ENGINE_LOG_FILE", "off");
     cmd
 }
 
@@ -119,28 +120,27 @@ fn spawn_engine(db: &Path, maintenance_secs: &str, heartbeat_secs: &str) -> Engi
     spawn_engine_with(db, maintenance_secs, heartbeat_secs, &[])
 }
 
-/// Like [`spawn_engine`] with debug-level stderr (`-v`), for tests that
-/// observe debug-only lines such as the heartbeat.
+/// Like [`spawn_engine`] with debug-level stderr (`RUST_LOG=debug`), for
+/// tests that observe debug-only lines such as the heartbeat.
 fn spawn_engine_verbose(db: &Path, maintenance_secs: &str, heartbeat_secs: &str) -> Engine {
-    spawn_engine_with(db, maintenance_secs, heartbeat_secs, &["-v"])
+    spawn_engine_with(
+        db,
+        maintenance_secs,
+        heartbeat_secs,
+        &[("RUST_LOG", "debug")],
+    )
 }
 
 fn spawn_engine_with(
     db: &Path,
     maintenance_secs: &str,
     heartbeat_secs: &str,
-    extra_flags: &[&str],
+    extra_env: &[(&str, &str)],
 ) -> Engine {
     let mut child = engine_command(db)
-        .args(extra_flags)
-        .args([
-            "run",
-            "--no-log-file",
-            "--maintenance-interval",
-            maintenance_secs,
-            "--heartbeat-interval",
-            heartbeat_secs,
-        ])
+        .env("VALQERON_ENGINE_MAINTENANCE_INTERVAL", maintenance_secs)
+        .env("VALQERON_ENGINE_HEARTBEAT_INTERVAL", heartbeat_secs)
+        .envs(extra_env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -175,11 +175,32 @@ fn lock_path(db: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// The binary is a service-manager payload configured purely through
+/// `VALQERON_*` env vars: every argument — including the retired `run`
+/// subcommand and clap's old `--help`/`--version` — must be rejected with the
+/// CONFIG exit code and a pointer at the environment contract, so a stale
+/// service definition fails fast and visibly in the manager's log.
 #[test]
-fn help_and_version_exit_zero() {
-    for flag in ["--help", "--version"] {
-        let output = Command::new(BIN).arg(flag).output().expect("run");
-        assert!(output.status.success(), "{flag} must succeed");
+fn any_argument_is_rejected() {
+    for arg in [
+        "run",
+        "install",
+        "uninstall",
+        "status",
+        "--help",
+        "--version",
+    ] {
+        let output = Command::new(BIN).arg(arg).output().expect("run");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{arg}` must be rejected with the CONFIG exit code"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("takes no arguments") && stderr.contains("VALQERON_"),
+            "`{arg}` rejection must explain the env-only contract:\n{stderr}"
+        );
     }
 }
 
@@ -196,31 +217,6 @@ fn starts_heartbeats_and_shuts_down_cleanly_on_sigterm() {
     assert!(lock.exists(), "lock file must exist while running");
     let recorded_pid = std::fs::read_to_string(&lock).expect("lock readable");
     assert_eq!(recorded_pid.trim(), engine.pid(), "lock records the pid");
-
-    // `status` agrees the engine is running (exit 0).
-    let status = engine_command(&db).arg("status").output().expect("status");
-    assert_eq!(status.status.code(), Some(0), "status must report running");
-
-    // `status --json` reports the same over the machine-readable surface.
-    let json_out = engine_command(&db)
-        .args(["status", "--json"])
-        .output()
-        .expect("status --json");
-    assert_eq!(json_out.status.code(), Some(0));
-    let report: serde_json::Value =
-        serde_json::from_slice(&json_out.stdout).expect("stdout must be one JSON object");
-    assert_eq!(report["engine"]["running"], serde_json::Value::Bool(true));
-    assert_eq!(
-        report["engine"]["pid"].to_string(),
-        engine.pid(),
-        "json pid must match the process"
-    );
-    assert!(
-        report["socket"]
-            .as_str()
-            .is_some_and(|s| s.ends_with("it.sock")),
-        "socket path reported: {report}"
-    );
 
     engine.signal("-TERM");
     assert_eq!(engine.wait_exit(), Some(0), "SIGTERM means clean exit 0");
@@ -273,7 +269,6 @@ fn second_instance_fails_fast_naming_holder() {
     first.wait_for_line("engine ready");
 
     let second = engine_command(&db)
-        .args(["run", "--no-log-file"])
         .output()
         .expect("second instance runs to completion");
 
@@ -325,92 +320,4 @@ fn sigkill_leaves_stale_lock_file_that_never_blocks_the_next_start() {
     second.signal("-TERM");
     assert_eq!(second.wait_exit(), Some(0));
     assert!(!lock.exists());
-}
-
-#[test]
-fn install_print_renders_the_service_definition_without_installing() {
-    let (_dir, db) = temp_db();
-    let output = engine_command(&db)
-        .args(["install", "--print"])
-        .output()
-        .expect("install --print");
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "print must succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    #[cfg(target_os = "macos")]
-    {
-        assert!(stdout.contains("<plist"), "plist body expected:\n{stdout}");
-        assert!(stdout.contains("io.valqeron.engine"), "{stdout}");
-        // Explicit overrides must be propagated into the agent environment.
-        assert!(stdout.contains("VALQERON_DB"), "{stdout}");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        assert!(
-            stdout.contains("Type=notify"),
-            "unit body expected:\n{stdout}"
-        );
-        assert!(stdout.contains("VALQERON_DB"), "{stdout}");
-    }
-
-    // The target path is reported on stderr, keeping stdout redirectable.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("install target:"),
-        "target note expected on stderr:\n{stderr}"
-    );
-}
-
-#[test]
-fn install_print_conflicts_with_no_start() {
-    let (_dir, db) = temp_db();
-    let output = engine_command(&db)
-        .args(["install", "--print", "--no-start"])
-        .output()
-        .expect("run");
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "--print and --no-start must conflict"
-    );
-}
-
-#[test]
-fn status_reports_not_running_with_nonzero_exit() {
-    let (_dir, db) = temp_db();
-    let output = engine_command(&db).arg("status").output().expect("status");
-    assert_eq!(output.status.code(), Some(1), "stopped engine → exit 1");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("not running"),
-        "status must say not running:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("socket:"),
-        "status must report the socket path:\n{stdout}"
-    );
-}
-
-#[test]
-fn status_json_reports_not_running_with_nonzero_exit() {
-    let (_dir, db) = temp_db();
-    let output = engine_command(&db)
-        .args(["status", "--json"])
-        .output()
-        .expect("status --json");
-    assert_eq!(output.status.code(), Some(1), "stopped engine → exit 1");
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("stdout must be one JSON object");
-    assert_eq!(report["engine"]["running"], serde_json::Value::Bool(false));
-    assert_eq!(report["engine"]["pid"], serde_json::Value::Null);
-    assert!(
-        report["database"]
-            .as_str()
-            .is_some_and(|s| s.ends_with("it.db"))
-    );
 }

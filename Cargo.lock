@@ -2209,7 +2209,6 @@ dependencies = [
 name = "valqeron-engine"
 version = "0.1.0"
 dependencies = [
- "clap",
  "directories",
  "serde_json",
  "tempfile",

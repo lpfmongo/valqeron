@@ -1,7 +1,37 @@
+//! The engine lifecycle, consolidated: configuration resolution, the
+//! single-instance lock, the phased (typestate) boot sequence, the serve
+//! loop, and the ordered teardown.
+//!
+//! Startup is a linear chain in which every phase consumes the previous one,
+//! so the strict resource order — lock → socket dir → stale-socket removal →
+//! database (migrations) → bind → runtime — cannot be rearranged without
+//! failing to compile:
+//!
+//! ```text
+//! Bootstrap::new(config)
+//!     .acquire_lock()?      exclusive flock on <db>.lock
+//!     .prepare_socket()?    0700 socket dir; unlink stale socket (safe: lock held)
+//!     .open_database()?     open SQLite, run migrations, wrap in AsyncStorage
+//!     .bind_socket()?       bind the std listener, 0600 — socket exists ⇒ DB migrated
+//!     .build_runtime()?     multi_thread tokio, named threads, capped blocking pool
+//! ```
+//!
+//! Binding happens synchronously *before* the runtime starts: readiness is a
+//! deterministic point in the boot sequence, and a client connecting in the
+//! window before serving queues in the listener backlog instead of racing the
+//! socket file into existence. Because the bind follows `open_database`, the
+//! invariant "socket exists ⇒ database is open and migrated" holds.
+//!
+//! Teardown runs in [`ValqeronEngine::serve`] in the exact reverse-dependency
+//! order the final checkpoint requires: drain the runtime → unlink the socket
+//! → reclaim and drop the engine (`PRAGMA optimize` + `wal_checkpoint(TRUNCATE)`)
+//! → release the lock last, after the checkpoint proves the database is quiesced.
+
 use crate::grpc::{AdminGrpc, IssuerGrpc};
 use crate::jobs::{JobSet, PeriodicJob};
 use crate::storage::AsyncStorage;
 use directories::ProjectDirs;
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Seek, SeekFrom, Write};
@@ -19,76 +49,138 @@ use valqeron_proto::v1::rpc_issuer_service_server::RpcIssuerServiceServer;
 // ================ TYPES ================
 pub type EngineResult<T> = Result<T, EngineError>;
 
-// ================ ERRORS ================
+// ================ ERRORS & EXIT CODES ================
+/// Exit codes for the engine binary.
+///
+/// Distinct codes let service managers and scripts distinguish "another
+/// instance already runs" (a benign race that must only be throttled, not
+/// treated as a crash-loop bug) from real failures.
+pub mod exit_code {
+    /// Generic runtime failure (including a forced shutdown).
+    pub const RUNTIME: i32 = 1;
+    /// Configuration could not be resolved.
+    pub const CONFIG: i32 = 2;
+    /// Another engine instance already holds the database lock.
+    pub const ALREADY_RUNNING: i32 = 3;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("configuration error: {0}")]
+    Config(String),
+
     #[error(
-        "could not determine a data directory for {app}; set {env_var} or pass --db-path explicitly"
+        "could not determine a data directory for {app}; set {env_var} or pass an explicit path"
     )]
-    InvalidDatabasePath {
+    InvalidDataDirectory {
         app: &'static str,
         env_var: &'static str,
     },
 
-    #[error("could not acquire lock on {db_path:?}: {pid} is already running")]
-    EngineAlreadyRunning {
-        db_path: std::path::PathBuf,
-        pid: String,
-    },
+    #[error("another engine instance already owns {} (pid {pid}); stop it first or check \
+    `valqeron engine status`", db_path.display())]
+    AlreadyRunning { db_path: PathBuf, pid: String },
 
-    #[error("could not open database: {0}")]
+    #[error("storage error: {0}")]
+    Storage(#[from] valqeron_core::StorageError),
+
+    #[error("i/o error: {0}")]
     Io(String),
 
-    #[error(transparent)]
-    StorageError(#[from] valqeron_core::StorageError),
-
-    #[error("force shutdown requested by user.")]
+    #[error("forced shutdown: second signal received before graceful shutdown finished")]
     ForcedShutdown,
 }
 
+impl EngineError {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            EngineError::Config(_) | EngineError::InvalidDataDirectory { .. } => exit_code::CONFIG,
+            EngineError::AlreadyRunning { .. } => exit_code::ALREADY_RUNNING,
+            EngineError::Storage(_) | EngineError::Io(_) | EngineError::ForcedShutdown => {
+                exit_code::RUNTIME
+            }
+        }
+    }
+}
+
 // ================ ENVIRONMENT VARIABLES ================
-/// Engine socket path environment variable.
-pub const ENGINE_SOCKET_PATH_ENV: &str = "VALQERON_ENGINE_SOCKET_PATH";
-/// Engine database path environment variable.
-pub const DB_PATH_ENV: &str = "VALQERON_ENGINE_DB_PATH";
-/// Engine log file path environment variable.
+// The engine binary takes no arguments: these variables — set in the service
+// definition (`scripts/install/*.example`) — are its entire configuration
+// surface. Every one of them falls back to a platform default when unset.
+
+/// Database path environment variable (engine-only; clients never see the file).
+/// The socket path (`VALQERON_SOCKET`) is resolved by `valqeron-proto`, shared
+/// knowledge with clients.
+pub const DB_PATH_ENV: &str = "VALQERON_DB";
+/// Engine log file path environment variable (`off` disables file logging).
 pub const ENGINE_LOG_FILE_ENV: &str = "VALQERON_ENGINE_LOG_FILE";
+/// Engine log file level environment variable (default `info`).
+pub const ENGINE_LOG_LEVEL_ENV: &str = "VALQERON_ENGINE_LOG_LEVEL";
+/// Strict-durability toggle: any value that is not off-like (`off`/`false`/
+/// `0`/`none`/empty) enables `PRAGMA synchronous=FULL`.
+pub const ENGINE_DURABLE_ENV: &str = "VALQERON_ENGINE_DURABLE";
+/// Seconds between database maintenance runs (whole seconds).
+pub const ENGINE_MAINTENANCE_INTERVAL_ENV: &str = "VALQERON_ENGINE_MAINTENANCE_INTERVAL";
+/// Seconds between heartbeat log lines (whole seconds).
+pub const ENGINE_HEARTBEAT_INTERVAL_ENV: &str = "VALQERON_ENGINE_HEARTBEAT_INTERVAL";
 
 // ================ DEFAULT VALUES ================
-pub const DEFAULT_ENGINE_SOCKET_PATH: &str = "/run/valqeron-engine.sock";
 pub const DEFAULT_VALQERON_QUALIFIER: &str = "io";
 pub const DEFAULT_VALQERON_ORGANIZATION: &str = "valqeron";
 pub const DEFAULT_VALQERON_APP: &str = "valqeron";
 pub const DEFAULT_ENGINE_DB_NAME: &str = "valqeron.db";
 pub const DEFAULT_ENGINE_LOG_FILE_NAME: &str = "engine.log";
+pub const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 3600;
+pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 300;
+
+// ================ SIZING & TIMEOUTS ================
+/// Reader-pool size: serves the gRPC read fan-out; writes serialize on the
+/// writer mutex regardless. The storage read lane takes exactly this many
+/// permits (see `storage.rs`).
+const READER_POOL_SIZE: usize = 4;
+
+/// Blocking-pool cap: every storage lane slot may hold a blocking thread
+/// (readers + the single writer), plus a small margin for tokio's own
+/// internal blocking work. The lanes bound admission; this bounds the pool
+/// itself (tokio's default is 512).
+const MAX_BLOCKING_THREADS: usize = READER_POOL_SIZE
+    .saturating_add(1) // the single writer
+    .saturating_add(2); // margin
+
+/// How long the graceful shutdown waits for in-flight RPCs / jobs / storage.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on draining the blocking pool when the runtime shuts down. A stuck
+/// job must not hold the process open forever — the service manager's SIGKILL
+/// (after `TimeoutStopSec` / launchd's exit timeout) is the final backstop.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ================ DATABASE PATH ================
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct DatabasePath(PathBuf);
 
 impl DatabasePath {
-    pub fn resolve(override_path: Option<PathBuf>) -> EngineResult<Self> {
+    /// `VALQERON_DB` > `<platform data dir>/valqeron.db`.
+    pub fn resolve() -> EngineResult<Self> {
         let project_data_dir =
             resolve_default_project_dir().map(|dirs| dirs.data_dir().to_path_buf());
 
-        Self::resolve_with_project_data_dir(override_path, project_data_dir)
+        Self::resolve_with(std::env::var_os(DB_PATH_ENV), project_data_dir)
     }
 
-    fn resolve_with_project_data_dir(
-        override_path: Option<PathBuf>,
+    /// Pure resolution core: env value and platform dir are injected so tests
+    /// never touch process-global environment state.
+    fn resolve_with(
+        env_value: Option<OsString>,
         project_data_dir: Option<PathBuf>,
     ) -> EngineResult<Self> {
-        if let Some(path) = override_path {
-            return Ok(Self(path));
-        }
-
-        if let Some(path) = std::env::var_os(DB_PATH_ENV) {
+        if let Some(path) = env_value {
             return Ok(Self(PathBuf::from(path)));
         }
 
         project_data_dir
             .map(|dir| Self(dir.join(DEFAULT_ENGINE_DB_NAME)))
-            .ok_or(EngineError::InvalidDatabasePath {
+            .ok_or(EngineError::InvalidDataDirectory {
                 app: DEFAULT_VALQERON_APP,
                 env_var: DB_PATH_ENV,
             })
@@ -96,20 +188,19 @@ impl DatabasePath {
 }
 
 // ================ SOCKET PATH ================
+/// The socket path is shared knowledge: engine and clients must resolve the
+/// same file, so resolution delegates to `valqeron-proto` (flag >
+/// `VALQERON_SOCKET` > platform runtime dir + `valqeron.sock`).
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct SocketPath(PathBuf);
 
 impl SocketPath {
-    pub fn resolve(override_path: Option<PathBuf>) -> Self {
-        if let Some(path) = override_path {
-            return Self(path);
-        }
-
-        if let Some(path) = std::env::var_os(ENGINE_SOCKET_PATH_ENV) {
-            return Self(PathBuf::from(path));
-        }
-
-        Self(PathBuf::from(DEFAULT_ENGINE_SOCKET_PATH))
+    /// `VALQERON_SOCKET` > platform runtime dir + `valqeron.sock` (resolved
+    /// by `valqeron-proto`, which reads the env var itself).
+    pub fn resolve() -> EngineResult<Self> {
+        valqeron_proto::resolve_socket_path(None)
+            .map(Self)
+            .map_err(|e| EngineError::Config(e.to_string()))
     }
 }
 
@@ -124,27 +215,34 @@ impl Display for SocketPath {
 pub struct LogFilePath(PathBuf);
 
 impl LogFilePath {
-    pub fn resolve(override_path: Option<PathBuf>) -> EngineResult<Self> {
-        let log_file_dir = resolve_default_project_dir().map(|dirs| dirs.data_dir().to_path_buf());
+    /// `VALQERON_ENGINE_LOG_FILE` (`off`/`false`/`0`/`none` disables) >
+    /// `<platform data dir>/engine.log`.
+    pub fn resolve() -> EngineResult<Option<Self>> {
+        let project_data_dir =
+            resolve_default_project_dir().map(|dirs| dirs.data_dir().to_path_buf());
 
-        Self::resolve_with_project_log_file(override_path, log_file_dir)
+        Self::resolve_with(std::env::var_os(ENGINE_LOG_FILE_ENV), project_data_dir)
     }
 
-    fn resolve_with_project_log_file(
-        override_path: Option<PathBuf>,
-        project_log_file_dir: Option<PathBuf>,
-    ) -> EngineResult<Self> {
-        if let Some(path) = override_path {
-            return Ok(Self(path));
+    /// Pure resolution core: env value and platform dir are injected so tests
+    /// never touch process-global environment state.
+    fn resolve_with(
+        env_value: Option<OsString>,
+        project_data_dir: Option<PathBuf>,
+    ) -> EngineResult<Option<Self>> {
+        if let Some(value) = env_value {
+            if valqeron_common::os_str_is_off(&value) {
+                return Ok(None);
+            }
+            if !value.is_empty() {
+                return Ok(Some(Self(PathBuf::from(value))));
+            }
+            // Set-but-empty falls through to the default, like unset.
         }
 
-        if let Some(path) = std::env::var_os(ENGINE_LOG_FILE_ENV) {
-            return Ok(Self(PathBuf::from(path)));
-        }
-
-        project_log_file_dir
-            .map(|dir| Self(dir.join(DEFAULT_ENGINE_LOG_FILE_NAME)))
-            .ok_or(EngineError::InvalidDatabasePath {
+        project_data_dir
+            .map(|dir| Some(Self(dir.join(DEFAULT_ENGINE_LOG_FILE_NAME))))
+            .ok_or(EngineError::InvalidDataDirectory {
                 app: DEFAULT_VALQERON_APP,
                 env_var: ENGINE_LOG_FILE_ENV,
             })
@@ -156,78 +254,77 @@ impl LogFilePath {
 pub struct EngineConfig {
     db_path: DatabasePath,
     socket_path: SocketPath,
-    log_file_path: LogFilePath,
+    /// `None` = file logging disabled.
+    log_file: Option<LogFilePath>,
+    durable: bool,
+    maintenance_interval: Duration,
+    heartbeat_interval: Duration,
 }
 
 impl EngineConfig {
-    pub fn builder() -> EngineConfigBuilder {
-        EngineConfigBuilder::new()
-    }
-
-    pub fn db_path(&self) -> &DatabasePath {
-        &self.db_path
-    }
-
-    pub fn socket_path(&self) -> &SocketPath {
-        &self.socket_path
-    }
-
-    pub fn log_file_path(&self) -> &LogFilePath {
-        &self.log_file_path
-    }
-}
-
-#[derive(Default)]
-pub struct EngineConfigBuilder {
-    db_path: Option<DatabasePath>,
-    socket_path: Option<SocketPath>,
-    log_file_path: Option<LogFilePath>,
-}
-
-impl EngineConfigBuilder {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn db_path(mut self, db_path: impl Into<DatabasePath>) -> Self {
-        self.db_path = Some(db_path.into());
-        self
-    }
-
-    pub fn socket_path(mut self, socket_path: impl Into<SocketPath>) -> Self {
-        self.socket_path = Some(socket_path.into());
-        self
-    }
-
-    pub fn log_file_path(mut self, log_file_path: impl Into<LogFilePath>) -> Self {
-        self.log_file_path = Some(log_file_path.into());
-        self
-    }
-
-    pub fn build(self) -> Result<EngineConfig, EngineError> {
-        let db_path = match self.db_path {
-            Some(path) => path,
-            None => DatabasePath::resolve(None)?,
-        };
-
-        let socket_path = self
-            .socket_path
-            .unwrap_or_else(|| SocketPath::resolve(None));
-
-        let log_file_path = match self.log_file_path {
-            Some(path) => path,
-            None => LogFilePath::resolve(None)?,
-        };
-
-        Ok(EngineConfig {
-            db_path,
-            socket_path,
-            log_file_path,
+    /// Resolve the full run configuration from the environment: `VALQERON_*`
+    /// variables (set in the service definition) win over platform defaults.
+    pub fn resolve() -> EngineResult<Self> {
+        Ok(Self {
+            db_path: DatabasePath::resolve()?,
+            socket_path: SocketPath::resolve()?,
+            log_file: LogFilePath::resolve()?,
+            durable: durable_from(std::env::var_os(ENGINE_DURABLE_ENV)),
+            maintenance_interval: Duration::from_secs(interval_secs_from(
+                ENGINE_MAINTENANCE_INTERVAL_ENV,
+                std::env::var_os(ENGINE_MAINTENANCE_INTERVAL_ENV),
+                DEFAULT_MAINTENANCE_INTERVAL_SECS,
+            )?),
+            heartbeat_interval: Duration::from_secs(interval_secs_from(
+                ENGINE_HEARTBEAT_INTERVAL_ENV,
+                std::env::var_os(ENGINE_HEARTBEAT_INTERVAL_ENV),
+                DEFAULT_HEARTBEAT_INTERVAL_SECS,
+            )?),
         })
     }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path.0
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path.0
+    }
+
+    /// Single-instance lock file: `.lock` appended to the full database file
+    /// name (`valqeron.db` → `valqeron.db.lock`).
+    pub fn lock_path(&self) -> PathBuf {
+        let mut os = self.db_path.0.as_os_str().to_os_string();
+        os.push(".lock");
+        PathBuf::from(os)
+    }
+
+    pub fn log_file(&self) -> Option<&Path> {
+        self.log_file.as_ref().map(|p| p.0.as_path())
+    }
+
+    pub fn synchronous(&self) -> Synchronous {
+        if self.durable {
+            Synchronous::Full
+        } else {
+            Synchronous::Normal
+        }
+    }
+
+    pub fn durability_label(&self) -> &'static str {
+        if self.durable { "full" } else { "normal" }
+    }
+
+    pub fn maintenance_interval(&self) -> Duration {
+        self.maintenance_interval
+    }
+
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
+    }
 }
 
-// ================ ENGINE LOCK UTIL ================
+// ================ ENGINE LOCK ================
 #[derive(Debug)]
 struct EngineLock {
     file: File,
@@ -256,7 +353,7 @@ impl EngineLock {
                     holder_pid = %pid,
                     "engine lock contended: another instance appears to be running"
                 );
-                return Err(EngineError::EngineAlreadyRunning { db_path, pid });
+                return Err(EngineError::AlreadyRunning { db_path, pid });
             }
             Err(TryLockError::Error(e)) => {
                 return Err(EngineError::Io(format!(
@@ -308,50 +405,47 @@ impl Drop for EngineLock {
         let _ = std::fs::remove_file(&self.path);
         let _ = self.file.unlock();
 
-        tracing::info!(
-            target: "valqeron::audit",
-            operation = "engine_stop",
+        tracing::debug!(
             lock_path = %self.path.display(),
             "single-instance lock released"
         );
     }
 }
 
-// ================ ENGINE INITIALIZATION ================
+// ================ PHASED BOOT SEQUENCE ================
+/// Phase 0: nothing acquired yet.
 struct Bootstrap<'c> {
     config: &'c EngineConfig,
 }
 
 impl<'c> Bootstrap<'c> {
     /// Start a boot sequence; logs the startup banner.
-    pub fn new(config: &'c EngineConfig) -> Self {
+    fn new(config: &'c EngineConfig) -> Self {
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
-            db_path = %config.db_path.0.display(),
-            socket_path = %config.socket_path.0.display(),
-            // lock_path = %config.lock_path().display(),
-            // maintenance_interval_secs = config.maintenance_interval().as_secs(),
-            // heartbeat_interval_secs = config.heartbeat_interval().as_secs(),
-            // durability = config.durability_label(),
-            // reader_pool_size = READER_POOL_SIZE,
-            "starting Valqeron Engine boot sequence"
+            db_path = %config.db_path().display(),
+            socket_path = %config.socket_path().display(),
+            lock_path = %config.lock_path().display(),
+            maintenance_interval_secs = config.maintenance_interval().as_secs(),
+            heartbeat_interval_secs = config.heartbeat_interval().as_secs(),
+            durability = config.durability_label(),
+            reader_pool_size = READER_POOL_SIZE,
+            "valqeron-engine starting"
         );
         Self { config }
     }
 
     /// Acquire the exclusive single-instance lock (`<db>.lock`).
     fn acquire_lock(self) -> EngineResult<Locked<'c>> {
-        // Ensure parent exists
-        if let Some(parent) = self.config.db_path.0.parent() {
+        // Ensure the database parent directory exists.
+        if let Some(parent) = self.config.db_path().parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| EngineError::Io(format!("creating {}: {e}", parent.display())))?;
         }
 
-        // Acquire the lock
-        let lock_file = self.config.db_path.0.with_extension(".lock");
-        let lock = EngineLock::acquire(self.config.db_path.0.to_path_buf(), lock_file)?;
+        let lock =
+            EngineLock::acquire(self.config.db_path().to_path_buf(), self.config.lock_path())?;
 
-        // Log the lock acquisition
         tracing::info!(
             target: "valqeron::audit",
             operation = "engine_start",
@@ -367,7 +461,7 @@ impl<'c> Bootstrap<'c> {
 }
 
 /// Phase 1: single-instance lock held.
-pub struct Locked<'c> {
+struct Locked<'c> {
     config: &'c EngineConfig,
     lock: EngineLock,
 }
@@ -375,12 +469,12 @@ pub struct Locked<'c> {
 impl<'c> Locked<'c> {
     /// Create the 0700 socket directory and unlink any leftover socket file.
     /// Safe because we hold the exclusive lock: no live engine can be serving on it.
-    pub fn prepare_socket(self) -> EngineResult<SocketReady<'c>> {
-        Self::ensure_socket_dir(self.config.socket_path.0.to_path_buf())?;
-        Self::remove_stale_socket(self.config.socket_path.0.as_path())?;
+    fn prepare_socket(self) -> EngineResult<SocketReady<'c>> {
+        Self::ensure_socket_dir(self.config.socket_path())?;
+        Self::remove_stale_socket(self.config.socket_path())?;
 
         tracing::info!(
-            socket_dir = ?self.config.socket_path.0.parent(),
+            socket_dir = ?self.config.socket_path().parent(),
             "socket directory prepared and restricted to 0700"
         );
 
@@ -392,7 +486,7 @@ impl<'c> Locked<'c> {
 
     /// Create the socket's parent directory and restrict it to `0700`.
     /// Directory permissions are the primary local access control for the engine socket.
-    fn ensure_socket_dir(socket: PathBuf) -> EngineResult<()> {
+    fn ensure_socket_dir(socket: &Path) -> EngineResult<()> {
         use std::os::unix::fs::PermissionsExt;
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)
@@ -420,7 +514,8 @@ impl<'c> Locked<'c> {
     }
 }
 
-pub struct SocketReady<'c> {
+/// Phase 2: socket directory prepared, stale socket removed (under the lock).
+struct SocketReady<'c> {
     config: &'c EngineConfig,
     lock: EngineLock,
 }
@@ -428,16 +523,17 @@ pub struct SocketReady<'c> {
 impl<'c> SocketReady<'c> {
     /// Open the database (migrations run here, before any reader exists) and
     /// wrap it in the lane-bounded storage facade.
-    pub fn open_database(self) -> EngineResult<DatabaseOpen<'c>> {
+    fn open_database(self) -> EngineResult<DatabaseOpen<'c>> {
         let db_config = DatabaseConfig {
-            synchronous: Synchronous::Normal,
+            reader_pool_size: READER_POOL_SIZE,
+            synchronous: self.config.synchronous(),
             ..DatabaseConfig::default()
         };
 
-        let engine = SqliteStorageEngine::open(self.config.db_path.0.as_path(), db_config)?;
+        let engine = SqliteStorageEngine::open(self.config.db_path(), db_config)?;
 
         tracing::info!(
-            db_path = %self.config.db_path.0.display(),
+            db_path = %self.config.db_path().display(),
             "database open; migrations applied"
         );
 
@@ -453,7 +549,7 @@ impl<'c> SocketReady<'c> {
 }
 
 /// Phase 3: database open, migrations applied, storage facade constructed.
-pub struct DatabaseOpen<'c> {
+struct DatabaseOpen<'c> {
     config: &'c EngineConfig,
     lock: EngineLock,
     storage: AsyncStorage,
@@ -463,8 +559,8 @@ impl<'c> DatabaseOpen<'c> {
     /// Bind the Unix listener synchronously and restrict the socket file.
     /// From this point connections queue in the backlog until serving starts;
     /// the socket's existence proves the database is open and migrated.
-    pub fn bind_socket(self) -> EngineResult<Bound<'c>> {
-        let socket_path = self.config.socket_path.0.as_path();
+    fn bind_socket(self) -> EngineResult<Bound<'c>> {
+        let socket_path = self.config.socket_path();
         let listener = StdUnixListener::bind(socket_path).map_err(|e| {
             EngineError::Io(format!("binding socket {}: {e}", socket_path.display()))
         })?;
@@ -500,7 +596,7 @@ impl<'c> DatabaseOpen<'c> {
 
 /// Phase 4: listener bound and restricted — the readiness point of the boot sequence. The listener
 /// is nonblocking, ready for tokio registration.
-pub struct Bound<'c> {
+struct Bound<'c> {
     config: &'c EngineConfig,
     lock: EngineLock,
     storage: AsyncStorage,
@@ -510,10 +606,11 @@ pub struct Bound<'c> {
 impl<'c> Bound<'c> {
     /// Build the multi-thread tokio runtime: named threads and a bounded
     /// blocking pool sized to the storage lanes.
-    pub fn build_runtime(self) -> EngineResult<ValqeronEngine<'c>> {
+    fn build_runtime(self) -> EngineResult<ValqeronEngine<'c>> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("valqeron-worker")
+            .max_blocking_threads(MAX_BLOCKING_THREADS)
             .build()
             .map_err(|e| EngineError::Io(format!("building tokio runtime: {e}")))?;
 
@@ -529,7 +626,8 @@ impl<'c> Bound<'c> {
     }
 }
 
-// ================ ENGINE CONFIGURATION ================
+// ================ THE ENGINE ================
+/// Phase 5: everything acquired; ready to serve.
 pub struct ValqeronEngine<'c> {
     config: &'c EngineConfig,
     lock: EngineLock,
@@ -539,27 +637,67 @@ pub struct ValqeronEngine<'c> {
 }
 
 impl ValqeronEngine<'_> {
-    fn start(config: &EngineConfig) -> EngineResult<()> {
-        let engine = Bootstrap::new(config)
+    /// The one public entry point: drive the full boot sequence, serve until
+    /// a shutdown signal, then tear down in checkpoint-safe order.
+    pub fn run(config: &EngineConfig) -> EngineResult<()> {
+        Self::boot(config)?.serve()
+    }
+
+    /// Drive the phased boot chain: lock → socket prep → open (migrations) →
+    /// bind → runtime.
+    fn boot(config: &EngineConfig) -> EngineResult<ValqeronEngine<'_>> {
+        Bootstrap::new(config)
             .acquire_lock()?
             .prepare_socket()?
             .open_database()?
             .bind_socket()?
-            .build_runtime()?;
+            .build_runtime()
+    }
 
-        engine
-            .runtime
-            .block_on(run_loop(engine.storage, engine.listener, engine.config))?;
+    /// Serve until shutdown, then tear down in reverse-dependency order:
+    /// drain the runtime → unlink the socket → reclaim and drop the engine
+    /// (final `wal_checkpoint(TRUNCATE)`) → release the lock last.
+    fn serve(self) -> EngineResult<()> {
+        let Self {
+            config,
+            lock,
+            storage,
+            listener,
+            runtime,
+        } = self;
 
-        Ok(())
+        let loop_result = runtime.block_on(run_loop(storage.clone(), listener, config));
+
+        // Wait (bounded) for any still-running blocking task before the final
+        // checkpoint; queued-but-unstarted tasks are dropped.
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+
+        let _ = std::fs::remove_file(config.socket_path());
+
+        match storage.into_engine() {
+            Ok(engine) => {
+                // Drop = PRAGMA optimize + wal_checkpoint(TRUNCATE).
+                drop(engine);
+                tracing::info!("final WAL checkpoint complete");
+            }
+            Err(_still_shared) => {
+                tracing::warn!(
+                    "a storage task still holds the engine; skipping the final checkpoint"
+                );
+            }
+        }
+
+        drop(lock);
+        tracing::info!(
+            target: "valqeron::audit",
+            operation = "engine_stop",
+            "engine stopped cleanly"
+        );
+        loop_result
     }
 }
 
-/// Drive the full boot sequence: acquire the single-instance lock, prepare
-/// and bind the socket, open the database (running migrations), and build
-/// the tokio runtime. This is the one public entry point into the phased
-/// boot sequence above — the CLI's `start` command should call this.
-
+// ================ SERVE LOOP ================
 async fn run_loop(
     storage: AsyncStorage,
     listener: StdUnixListener,
@@ -578,14 +716,14 @@ async fn run_loop(
     let listener = UnixListener::from_std(listener).map_err(|e| {
         EngineError::Io(format!(
             "registering socket {} with the runtime: {e}",
-            config.socket_path.0.display()
+            config.socket_path().display()
         ))
     })?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let issuer_service = RpcIssuerServiceServer::new(IssuerGrpc::new(storage.clone()));
     let admin_service = RpcAdminServiceServer::new(AdminGrpc::new(
-        config.db_path.0.display().to_string(),
+        config.db_path().display().to_string(),
         started,
     ));
 
@@ -601,7 +739,7 @@ async fn run_loop(
     tracing::info!(
         target: "valqeron::audit",
         operation = "grpc_listen",
-        socket = %config.socket_path.0.display(),
+        socket = %config.socket_path().display(),
         "gRPC server listening"
     );
 
@@ -611,7 +749,7 @@ async fn run_loop(
     tracing::info!(
         target: "valqeron::audit",
         operation = "engine_ready",
-        socket = %config.socket_path.0.display(),
+        socket = %config.socket_path().display(),
         "engine ready"
     );
     crate::notify::notify_ready();
@@ -622,7 +760,7 @@ async fn run_loop(
     jobs.spawn(
         PeriodicJob {
             name: "db_maintenance",
-            period: Duration::from_secs(1),
+            period: config.maintenance_interval(),
             jitter: true,
         },
         {
@@ -647,7 +785,7 @@ async fn run_loop(
     jobs.spawn(
         PeriodicJob {
             name: "heartbeat",
-            period: Duration::from_secs(1),
+            period: config.heartbeat_interval(),
             jitter: false,
         },
         move || async move {
@@ -696,9 +834,9 @@ async fn run_loop(
                 tracing::warn!(error = %e, "gRPC server ended with an error during drain");
             }
         }
-        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+        _ = tokio::time::sleep(DRAIN_TIMEOUT) => {
             tracing::warn!(
-                drain_timeout_secs = Duration::from_secs(10).as_secs(),
+                drain_timeout_secs = DRAIN_TIMEOUT.as_secs(),
                 "gRPC server did not drain within the deadline; aborting it"
             );
             server.abort();
@@ -707,16 +845,16 @@ async fn run_loop(
 
     // Stop the periodic jobs (waiting for any body still in flight), then
     // reject new storage work and wait for in-flight closures to finish.
-    if !jobs.drain(Duration::from_secs(10)).await {
+    if !jobs.drain(DRAIN_TIMEOUT).await {
         tracing::warn!(
-            drain_timeout_secs = Duration::from_secs(10).as_secs(),
+            drain_timeout_secs = DRAIN_TIMEOUT.as_secs(),
             "background jobs did not finish within the drain deadline"
         );
     }
     storage.close();
-    if !storage.wait_idle(Duration::from_secs(10)).await {
+    if !storage.wait_idle(DRAIN_TIMEOUT).await {
         tracing::warn!(
-            drain_timeout_secs = Duration::from_secs(10).as_secs(),
+            drain_timeout_secs = DRAIN_TIMEOUT.as_secs(),
             "storage closures still in flight after the drain deadline"
         );
     }
@@ -730,6 +868,37 @@ fn resolve_default_project_dir() -> Option<ProjectDirs> {
         DEFAULT_VALQERON_ORGANIZATION,
         DEFAULT_VALQERON_APP,
     )
+}
+
+/// Truthy [`ENGINE_DURABLE_ENV`] enables strict durability; unset, empty, or
+/// an off-value (`off`/`false`/`0`/`none`) keeps the relaxed default.
+fn durable_from(env_value: Option<OsString>) -> bool {
+    env_value
+        .map(|value| !value.is_empty() && !valqeron_common::os_str_is_off(&value))
+        .unwrap_or(false)
+}
+
+/// Whole-second interval from an environment variable. Unset or empty means
+/// the default; anything else must parse as `u64`, otherwise the engine
+/// refuses to start (misconfiguration must not silently become a default).
+fn interval_secs_from(
+    var: &'static str,
+    env_value: Option<OsString>,
+    default_secs: u64,
+) -> EngineResult<u64> {
+    let Some(value) = env_value else {
+        return Ok(default_secs);
+    };
+    let text = value.to_str().ok_or_else(|| {
+        EngineError::Config(format!("{var} must be whole seconds (not valid UTF-8)"))
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(default_secs);
+    }
+    trimmed.parse::<u64>().map_err(|e| {
+        EngineError::Config(format!("{var} must be whole seconds, got {trimmed:?}: {e}"))
+    })
 }
 
 fn server_exit_error(
@@ -777,31 +946,56 @@ fn server_join_outcome(
 }
 
 #[cfg(test)]
-mod tests {
+mod config_tests {
     use super::*;
 
-    #[test]
-    fn test_engine_config_builder_resolves_defaults() {
-        let config = EngineConfigBuilder::new().build().unwrap();
-
-        assert!(Some(config.db_path).is_some());
-        assert_eq!(
-            config.socket_path.0,
-            PathBuf::from(DEFAULT_ENGINE_SOCKET_PATH)
-        );
+    /// Builds a config directly (bypassing env resolution) to exercise the
+    /// derived accessors; the resolution cores are tested separately through
+    /// their injected-value helpers.
+    fn config_with(db: &str, durable: bool) -> EngineConfig {
+        EngineConfig {
+            db_path: DatabasePath(PathBuf::from(db)),
+            socket_path: SocketPath(PathBuf::from("/tmp/x.sock")),
+            log_file: None,
+            durable,
+            maintenance_interval: Duration::from_secs(10),
+            heartbeat_interval: Duration::from_secs(20),
+        }
     }
 
     #[test]
-    fn test_database_path_resolve_errors_when_no_override_env_or_project_dir() {
-        unsafe {
-            std::env::remove_var(DB_PATH_ENV);
-        }
+    fn config_exposes_the_derived_values() {
+        let config = config_with("/tmp/x.db", true);
 
-        let result = DatabasePath::resolve_with_project_data_dir(None, None);
+        assert_eq!(config.db_path(), Path::new("/tmp/x.db"));
+        assert_eq!(config.socket_path(), Path::new("/tmp/x.sock"));
+        assert_eq!(config.lock_path(), PathBuf::from("/tmp/x.db.lock"));
+        assert_eq!(config.log_file(), None);
+        assert_eq!(config.synchronous(), Synchronous::Full);
+        assert_eq!(config.durability_label(), "full");
+        assert_eq!(config.maintenance_interval(), Duration::from_secs(10));
+        assert_eq!(config.heartbeat_interval(), Duration::from_secs(20));
+    }
 
+    #[test]
+    fn lock_path_appends_to_the_full_file_name() {
+        let config = config_with("/data/valqeron.db", false);
+        assert_eq!(config.lock_path(), PathBuf::from("/data/valqeron.db.lock"));
+    }
+
+    #[test]
+    fn default_durability_is_relaxed() {
+        let config = config_with("/tmp/y.db", false);
+        assert_eq!(config.synchronous(), Synchronous::Normal);
+        assert_eq!(config.durability_label(), "normal");
+    }
+
+    #[test]
+    fn database_path_errors_when_no_env_or_project_dir() {
+        let result = DatabasePath::resolve_with(None, None);
         assert!(matches!(
             result,
-            Err(EngineError::InvalidDatabasePath {
+            Err(EngineError::InvalidDataDirectory {
                 app: DEFAULT_VALQERON_APP,
                 env_var: DB_PATH_ENV,
             })
@@ -809,20 +1003,152 @@ mod tests {
     }
 
     #[test]
-    fn test_log_file_path_resolve_errors_when_no_override_env_or_project_dir() {
-        unsafe {
-            std::env::remove_var(ENGINE_LOG_FILE_ENV);
+    fn database_path_prefers_the_env_value() {
+        let result = DatabasePath::resolve_with(
+            Some(OsString::from("/tmp/override.db")),
+            Some(PathBuf::from("/data")),
+        )
+        .unwrap();
+        assert_eq!(result.0, PathBuf::from("/tmp/override.db"));
+    }
+
+    #[test]
+    fn database_path_falls_back_to_the_project_dir() {
+        let result = DatabasePath::resolve_with(None, Some(PathBuf::from("/data"))).unwrap();
+        assert_eq!(
+            result.0,
+            PathBuf::from("/data").join(DEFAULT_ENGINE_DB_NAME)
+        );
+    }
+
+    #[test]
+    fn log_file_off_value_disables_logging() {
+        for off in ["off", "OFF", "false", "0", "none"] {
+            let result =
+                LogFilePath::resolve_with(Some(OsString::from(off)), Some(PathBuf::from("/data")))
+                    .unwrap();
+            assert_eq!(result, None, "{off:?} must disable file logging");
         }
+    }
 
-        let result = LogFilePath::resolve_with_project_log_file(None, None);
+    #[test]
+    fn log_file_env_path_wins() {
+        let result = LogFilePath::resolve_with(
+            Some(OsString::from("/tmp/engine.log")),
+            Some(PathBuf::from("/data")),
+        )
+        .unwrap();
+        assert_eq!(result, Some(LogFilePath(PathBuf::from("/tmp/engine.log"))));
+    }
 
+    #[test]
+    fn log_file_unset_or_empty_uses_the_default_path() {
+        let default = Some(LogFilePath(
+            PathBuf::from("/data").join(DEFAULT_ENGINE_LOG_FILE_NAME),
+        ));
+        for env_value in [None, Some(OsString::new())] {
+            let result =
+                LogFilePath::resolve_with(env_value.clone(), Some(PathBuf::from("/data"))).unwrap();
+            assert_eq!(result, default, "{env_value:?} must use the default path");
+        }
+    }
+
+    #[test]
+    fn log_file_errors_when_no_env_or_project_dir() {
+        let result = LogFilePath::resolve_with(None, None);
         assert!(matches!(
             result,
-            Err(EngineError::InvalidDatabasePath {
+            Err(EngineError::InvalidDataDirectory {
                 app: DEFAULT_VALQERON_APP,
                 env_var: ENGINE_LOG_FILE_ENV,
             })
         ));
+    }
+
+    #[test]
+    fn durable_requires_a_truthy_value() {
+        for truthy in ["1", "true", "yes", "full"] {
+            assert!(
+                durable_from(Some(OsString::from(truthy))),
+                "{truthy:?} must enable durability"
+            );
+        }
+        for falsy in ["off", "false", "0", "none", ""] {
+            assert!(
+                !durable_from(Some(OsString::from(falsy))),
+                "{falsy:?} must keep the relaxed default"
+            );
+        }
+        assert!(!durable_from(None), "unset must keep the relaxed default");
+    }
+
+    #[test]
+    fn intervals_default_when_unset_or_empty_and_parse_when_set() {
+        for env_value in [None, Some(OsString::new()), Some(OsString::from("  "))] {
+            assert_eq!(
+                interval_secs_from(ENGINE_MAINTENANCE_INTERVAL_ENV, env_value, 3600).unwrap(),
+                3600
+            );
+        }
+        assert_eq!(
+            interval_secs_from(
+                ENGINE_MAINTENANCE_INTERVAL_ENV,
+                Some(OsString::from(" 42 ")),
+                3600
+            )
+            .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn invalid_intervals_are_config_errors_naming_the_variable() {
+        for bad in ["abc", "-1", "1.5", "10s"] {
+            let err = interval_secs_from(
+                ENGINE_HEARTBEAT_INTERVAL_ENV,
+                Some(OsString::from(bad)),
+                300,
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), exit_code::CONFIG, "{bad:?} must be CONFIG");
+            assert!(
+                err.to_string().contains(ENGINE_HEARTBEAT_INTERVAL_ENV),
+                "error must name the variable: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_codes_map_per_error_class() {
+        assert_eq!(
+            EngineError::Config("bad".into()).exit_code(),
+            exit_code::CONFIG
+        );
+        assert_eq!(
+            EngineError::InvalidDataDirectory {
+                app: DEFAULT_VALQERON_APP,
+                env_var: DB_PATH_ENV
+            }
+            .exit_code(),
+            exit_code::CONFIG
+        );
+        assert_eq!(
+            EngineError::Io("boom".into()).exit_code(),
+            exit_code::RUNTIME
+        );
+        assert_eq!(EngineError::ForcedShutdown.exit_code(), exit_code::RUNTIME);
+    }
+
+    #[test]
+    fn already_running_maps_to_its_dedicated_exit_code_and_names_the_holder() {
+        let err = EngineError::AlreadyRunning {
+            db_path: PathBuf::from("/tmp/x.db"),
+            pid: "123".to_string(),
+        };
+        assert_eq!(err.exit_code(), exit_code::ALREADY_RUNNING);
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/x.db"), "message names the db: {msg}");
+        assert!(msg.contains("123"), "message names the pid: {msg}");
     }
 }
 
@@ -853,7 +1179,7 @@ mod lock_tests {
 
         let err = EngineLock::acquire(db.clone(), lock_path).unwrap_err();
         match err {
-            EngineError::EngineAlreadyRunning { db_path, pid } => {
+            EngineError::AlreadyRunning { db_path, pid } => {
                 assert_eq!(db_path, db);
                 assert_eq!(pid, std::process::id().to_string());
             }
@@ -886,118 +1212,139 @@ mod lock_tests {
     }
 }
 
-// #[cfg(test)]
-// mod boot_tests {
-//     use super::*;
-//     use std::os::unix::fs::PermissionsExt;
-//
-//     /// Builds a config pointing entirely inside `dir`, bypassing `resolve()`
-//     /// (and therefore env vars / OS project-dir lookups) so each test is
-//     /// fully isolated and safe to run in parallel.
-//     fn test_config(dir: &Path) -> EngineConfig {
-//         EngineConfig {
-//             db_path: DatabasePath(dir.join("test.db")),
-//             socket_path: SocketPath(dir.join("run").join("test.sock")),
-//             log_file_path: LogFilePath(dir.join("test.log")),
-//         }
-//     }
-//
-//     #[test]
-//     fn boots_end_to_end_and_starts_cleanly() {
-//         let dir = tempfile::tempdir().unwrap();
-//         let config = test_config(dir.path());
-//
-//         let engine = boot(&config).expect("engine should boot");
-//         assert!(
-//             config.socket_path.0.exists(),
-//             "socket file should exist once bound"
-//         );
-//         engine.start().expect("engine should start");
-//     }
-//
-//     #[test]
-//     fn socket_dir_and_file_have_restricted_permissions() {
-//         let dir = tempfile::tempdir().unwrap();
-//         let config = test_config(dir.path());
-//
-//         let engine = boot(&config).unwrap();
-//
-//         let dir_mode = std::fs::metadata(config.socket_path.0.parent().unwrap())
-//             .unwrap()
-//             .permissions()
-//             .mode()
-//             & 0o777;
-//         assert_eq!(dir_mode, 0o700, "socket parent dir should be 0700");
-//
-//         let file_mode = std::fs::metadata(&config.socket_path.0)
-//             .unwrap()
-//             .permissions()
-//             .mode()
-//             & 0o777;
-//         assert_eq!(file_mode, 0o600, "socket file should be 0600");
-//
-//         engine.start().unwrap();
-//     }
-//
-//     #[test]
-//     fn second_boot_against_same_db_fails_while_first_is_running() {
-//         let dir = tempfile::tempdir().unwrap();
-//         let config = test_config(dir.path());
-//
-//         let _first = boot(&config).expect("first boot should succeed");
-//         let second = boot(&config);
-//
-//         assert!(matches!(
-//             second,
-//             Err(EngineError::EngineAlreadyRunning { .. })
-//         ));
-//     }
-//
-//     #[test]
-//     fn boot_succeeds_again_after_previous_engine_is_dropped() {
-//         let dir = tempfile::tempdir().unwrap();
-//         let config = test_config(dir.path());
-//
-//         let first = boot(&config).expect("first boot should succeed");
-//         drop(first);
-//
-//         let second = boot(&config);
-//         assert!(
-//             second.is_ok(),
-//             "boot should succeed again once the lock is released"
-//         );
-//     }
-//
-//     #[test]
-//     fn stale_socket_file_does_not_block_a_fresh_boot() {
-//         let dir = tempfile::tempdir().unwrap();
-//         let config = test_config(dir.path());
-//
-//         // Simulate a leftover socket file from a crashed engine (no lock held).
-//         std::fs::create_dir_all(config.socket_path.0.parent().unwrap()).unwrap();
-//         std::fs::write(&config.socket_path.0, b"not a real socket").unwrap();
-//
-//         let engine = boot(&config);
-//         assert!(
-//             engine.is_ok(),
-//             "a stale socket file must not block a fresh boot"
-//         );
-//     }
-//
-//     #[test]
-//     fn missing_parent_directories_are_created() {
-//         let dir = tempfile::tempdir().unwrap();
-//         let nested = dir.path().join("does").join("not").join("exist");
-//         let config = EngineConfig {
-//             db_path: DatabasePath(nested.join("test.db")),
-//             socket_path: SocketPath(nested.join("run").join("test.sock")),
-//             log_file_path: LogFilePath(nested.join("test.log")),
-//         };
-//
-//         let engine = boot(&config);
-//         assert!(
-//             engine.is_ok(),
-//             "boot should create missing db and socket parent directories"
-//         );
-//     }
-// }
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Builds a config pointing entirely inside `dir`, bypassing `resolve()`
+    /// (and therefore env vars / OS project-dir lookups) so each test is
+    /// fully isolated and safe to run in parallel.
+    fn test_config(dir: &Path) -> EngineConfig {
+        EngineConfig {
+            db_path: DatabasePath(dir.join("test.db")),
+            socket_path: SocketPath(dir.join("run").join("test.sock")),
+            log_file: None,
+            durable: false,
+            maintenance_interval: Duration::from_secs(3600),
+            heartbeat_interval: Duration::from_secs(3600),
+        }
+    }
+
+    #[test]
+    fn boot_chain_acquires_resources_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        let locked = Bootstrap::new(&config).acquire_lock().unwrap();
+        assert!(config.lock_path().exists(), "lock file after acquire_lock");
+        assert!(!config.db_path().exists(), "no db before open_database");
+
+        let engine = locked
+            .prepare_socket()
+            .unwrap()
+            .open_database()
+            .unwrap()
+            .bind_socket()
+            .unwrap()
+            .build_runtime()
+            .unwrap();
+        assert!(config.db_path().exists(), "db exists after open_database");
+        assert!(
+            config.socket_path().exists(),
+            "socket exists after bind_socket"
+        );
+
+        drop(engine);
+        assert!(
+            !config.lock_path().exists(),
+            "dropping the boot chain releases the lock"
+        );
+    }
+
+    #[test]
+    fn socket_dir_and_file_have_restricted_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        let engine = ValqeronEngine::boot(&config).unwrap();
+
+        let dir_mode = std::fs::metadata(config.socket_path().parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "socket parent dir should be 0700");
+
+        let file_mode = std::fs::metadata(config.socket_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "socket file should be 0600");
+
+        drop(engine);
+    }
+
+    #[test]
+    fn second_boot_against_same_db_fails_while_first_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        let _first = ValqeronEngine::boot(&config).expect("first boot should succeed");
+        let second = ValqeronEngine::boot(&config);
+
+        assert!(matches!(second, Err(EngineError::AlreadyRunning { .. })));
+    }
+
+    #[test]
+    fn boot_succeeds_again_after_previous_engine_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        let first = ValqeronEngine::boot(&config).expect("first boot should succeed");
+        drop(first);
+
+        let second = ValqeronEngine::boot(&config);
+        assert!(
+            second.is_ok(),
+            "boot should succeed again once the lock is released"
+        );
+    }
+
+    #[test]
+    fn stale_socket_file_does_not_block_a_fresh_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        // Simulate a leftover socket file from a crashed engine (no lock held).
+        std::fs::create_dir_all(config.socket_path().parent().unwrap()).unwrap();
+        std::fs::write(config.socket_path(), b"not a real socket").unwrap();
+
+        let engine = ValqeronEngine::boot(&config);
+        assert!(
+            engine.is_ok(),
+            "a stale socket file must not block a fresh boot"
+        );
+    }
+
+    #[test]
+    fn missing_parent_directories_are_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("does").join("not").join("exist");
+        let config = EngineConfig {
+            db_path: DatabasePath(nested.join("test.db")),
+            socket_path: SocketPath(nested.join("run").join("test.sock")),
+            log_file: None,
+            durable: false,
+            maintenance_interval: Duration::from_secs(3600),
+            heartbeat_interval: Duration::from_secs(3600),
+        };
+
+        let engine = ValqeronEngine::boot(&config);
+        assert!(
+            engine.is_ok(),
+            "boot should create missing db and socket parent directories"
+        );
+    }
+}

@@ -13,7 +13,7 @@ lives in [internals.md](internals.md).
 
 ```
 1. Process        exclusive flock on <db>.lock            at most one engine per database
-2. Main thread    synchronous bootstrap + teardown        crates/engine/src/bootstrap.rs
+2. Main thread    synchronous bootstrap + teardown        crates/engine/src/engine.rs
 3. Tokio workers  multi_thread runtime ("valqeron-worker") gRPC protocol, signals, job timers
 4. Blocking pool  spawn_blocking, capped, lane-bounded    every storage closure
 5. SQLite         1 writer mutex + 4-reader Condvar pool  loom-verified, fully synchronous
@@ -23,7 +23,7 @@ Only layer 3 is async. Layers 1–2 and 4–5 are ordinary blocking code; the si
 between the worlds is `AsyncStorage` (layer 3 → 4), and everything below it is the untouched,
 loom-verified model from `valqeron-infrastructure`.
 
-## Bootstrap: typed phases (`bootstrap.rs`)
+## Bootstrap: typed phases (`engine.rs`)
 
 Startup is a typestate chain — each phase consumes the previous, so the resource order cannot be
 rearranged without failing to compile:
@@ -35,7 +35,7 @@ Bootstrap::new(config)        startup banner
   .open_database()?           open SQLite + run migrations; wrap in AsyncStorage
   .bind_socket()?             bind std UnixListener, nonblocking, chmod 0600
   .build_runtime()?           multi_thread tokio, named threads, capped blocking pool
-  .run()                      block_on(run_loop) + ordered teardown
+→ ValqeronEngine::serve()     block_on(run_loop) + ordered teardown
 ```
 
 Two properties are load-bearing:
@@ -154,7 +154,7 @@ The lane drain is what makes the final checkpoint deterministic: `Arc::try_unwra
 when no closure still holds the engine. The service-manager stop timeout (60 s in the unit
 templates) exceeds the sum of the internal budgets, so a graceful stop is never truncated
 mid-checkpoint; SIGKILL remains the final backstop for truly stuck work. Exit codes: `0` clean,
-`1` runtime/forced, `2` config, `3` already running, `4` service-manager failure.
+`1` runtime/forced, `2` config, `3` already running.
 
 ## Client-side runtime
 

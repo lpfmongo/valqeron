@@ -7,4 +7,8 @@
 /test_app.db-wal
 /test_app.db-shm
 
+# machine-local service definitions (created from the committed .example files)
+/scripts/install/io.valqeron.engine.plist
+/scripts/install/valqeron-engine.service
+
 .DS_Store

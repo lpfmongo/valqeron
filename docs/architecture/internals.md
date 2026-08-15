@@ -39,7 +39,7 @@ behind lane semaphores.
 
 | Thread | Count | Born | Dies | Does |
 |---|---|---|---|---|
-| **main** | 1 | process start | process exit | clap dispatch → bootstrap phases (lock, migrations, bind — all blocking) → `block_on(run_loop)` → polls `run_loop` itself → ordered teardown |
+| **main** | 1 | process start | process exit | argv guard (no arguments) + env config → bootstrap phases (lock, migrations, bind — all blocking) → `block_on(run_loop)` → polls `run_loop` itself → ordered teardown |
 | **`valqeron-worker`** | N = available cores | the bootstrap `build_runtime` phase | `runtime.shutdown_timeout(20s)` | h2 protocol work, RPC handler futures, job timers, signal streams, semaphore waiters |
 | **blocking pool** | 0→7, lazily spawned, idle-reaped | first `spawn_blocking` | runtime shutdown | storage closures only. Capped at `MAX_BLOCKING_THREADS = 4+1+2` — tokio's default is 512; the cap makes thread explosion structurally impossible |
 | **tracing-appender worker** | 0 or 1 | `logging::init` when a log file is configured | `WorkerGuard` drop (held in `main.rs::dispatch`) | drains the non-blocking channel into the JSON log file, so no handler ever blocks on log disk I/O |
@@ -334,17 +334,23 @@ Make the sharpest bug classes **unrepresentable rather than discouraged**:
   network database); that would be a new backend crate behind the same evaluation, not an
   asyncification of this one.
 
-### Related decision: service registration stays in the binary
+### Related decision: service registration moved out of the binary
 
-`install`/`uninstall`/`status` were evaluated against shell-script alternatives and kept
-in-binary. The unit definition embeds resolved paths (systemd `ReadWritePaths` sandbox
-punch-through, env overrides) that must match the engine's own resolution *exactly* — a script
-would duplicate the `ProjectDirs`/env-precedence logic, and drift produces a crash-looping
-service. The template also ships in lockstep with the behavior it declares (`Type=notify` ⇔
-sd_notify support), which a separately-versioned script cannot guarantee. The transparency
-argument for scripts is answered by `install --print` (exact render to stdout, no side
-effects); a shell layer remains appropriate later for *distribution* (fetching the binary),
-which then delegates registration to `valqeron-engine install`.
+`install`/`uninstall`/`status` subcommands were originally kept in-binary; that decision was
+**reversed**: installation/upgrade has a different lifecycle from the daemon (it happens at
+deployment time, not runtime), so the binary takes no arguments at all (clap removed; any argv
+is rejected as a config error; all configuration is `VALQERON_*` env vars carried by the
+service definition), and registration is owned
+by the `just engine-install` / `just engine-uninstall` recipes — the development stand-in for
+future packaging (brew services, deb/rpm postinst). The cost accepted with this move: the
+recipes mirror the engine's `ProjectDirs`/env-precedence resolution rather than sharing code
+with it, so path-resolution changes in `engine.rs` must be reflected there (both sides honor
+the same `VALQERON_DB`/`VALQERON_SOCKET`/`VALQERON_ENGINE_LOG_FILE` overrides, which bounds the
+drift risk: pinning the env vars in the unit definition makes both resolutions agree by
+construction). The `Type=notify` ⇔ sd_notify lockstep still holds — the recipe lives in the
+same repository and changes with the engine. Runtime liveness probing moved to the client
+(`valqeron engine ping`/`status`), where it belongs: it is an RPC concern, not a
+service-manager one.
 
 ## 7. Invariants (consolidated)
 

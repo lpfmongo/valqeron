@@ -42,24 +42,17 @@ impl Harness {
         let db = dir.path().join("e2e.db");
         let socket = dir.path().join("e2e.sock");
 
+        // The binary takes no arguments: configuration is injected through
+        // VALQERON_* env vars, with inherited ones scrubbed first.
         let mut child = Command::new(BIN)
             .env_remove("RUST_LOG")
-            .env_remove("VALQERON_DB")
-            .env_remove("VALQERON_SOCKET")
-            .env_remove("VALQERON_ENGINE_LOG_FILE")
             .env_remove("VALQERON_ENGINE_LOG_LEVEL")
-            .arg("--db-path")
-            .arg(&db)
-            .arg("--socket")
-            .arg(&socket)
-            .args([
-                "run",
-                "--no-log-file",
-                "--maintenance-interval",
-                "3600",
-                "--heartbeat-interval",
-                "3600",
-            ])
+            .env_remove("VALQERON_ENGINE_DURABLE")
+            .env("VALQERON_DB", &db)
+            .env("VALQERON_SOCKET", &socket)
+            .env("VALQERON_ENGINE_LOG_FILE", "off")
+            .env("VALQERON_ENGINE_MAINTENANCE_INTERVAL", "3600")
+            .env("VALQERON_ENGINE_HEARTBEAT_INTERVAL", "3600")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

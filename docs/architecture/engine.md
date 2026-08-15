@@ -46,22 +46,26 @@ Dependency rules: `infrastructure` is reachable only from `engine`; `tokio`/`ton
 ## Engine internals
 
 ```
-main.rs ── clap dispatch: run | install | uninstall | status
-├── config.rs     EngineConfig (db path, socket path, intervals, durability) + lane sizing
-├── paths.rs      db/log resolution (flag > env > platform dir)
-├── lockfile.rs   EngineLock: exclusive advisory flock on <db>.lock
-├── bootstrap.rs  typed boot phases: lock → socket prep → open → bind → runtime; teardown
+main.rs ── no argv (any argument is a config error) + logging init: stderr
+│          (info default, RUST_LOG overrides) + JSON file; valqeron::audit
+│          stays on stderr
+├── engine.rs     the whole lifecycle, consolidated: EngineConfig resolution
+│                 (VALQERON_* env > platform dir), EngineLock (exclusive
+│                 advisory flock on <db>.lock), typed boot phases (lock →
+│                 socket prep → open → bind → runtime), run_loop (serve →
+│                 signal → ordered drain), checkpoint-safe teardown, exit codes
 ├── storage.rs    AsyncStorage: the async→sync bridge (read/write lanes)
 ├── jobs.rs       PeriodicJob/JobSet: background work (maintenance, heartbeat)
 ├── notify.rs     sd_notify READY=1/STOPPING=1 (no-op without $NOTIFY_SOCKET)
-├── grpc/
-│   ├── issuer.rs IssuerService: register/get/list/patch/delete (unary)
-│   ├── admin.rs  AdminService: health (handshake), status
-│   └── problem.rs error → (tonic::Code, RFC-7807 ProblemDetail)
-├── runtime.rs    run_loop: serve → signal → ordered drain
-├── logging.rs    stderr (info default) + JSON file; valqeron::audit stays on stderr
-└── service/      launchd plist / systemd user unit (embedded templates)
+└── grpc/
+    ├── issuer.rs IssuerService: register/get/list/patch/delete (unary)
+    ├── admin.rs  AdminService: health (handshake), status
+    └── problem.rs error → (tonic::Code, RFC-7807 ProblemDetail)
 ```
+
+Service registration (launchd/systemd) is **not** part of the binary: installation and upgrade
+have their own lifecycle, owned by the `just engine-install` / `just engine-uninstall` recipes
+(see “Service management” below).
 
 ### Request path
 
@@ -114,9 +118,9 @@ Every mutating RPC carries `dry_run: bool`. The handler passes the flag to `Asyn
 closure body in `StorageEngine::dry_run` — a savepoint that always rolls back. One RPC = one dry-run scope; there are
 no multi-RPC dry-run sessions. The CLI's `--dry-run` simply sets the flag.
 
-### Lifecycle (`runtime.rs`)
+### Lifecycle (`engine.rs`)
 
-Startup is a typed phase chain (`bootstrap.rs`; mis-ordering does not compile): acquire exclusive flock on `<db>.lock`
+Startup is a typed phase chain (mis-ordering does not compile): acquire exclusive flock on `<db>.lock`
 → ensure socket dir exists with `0700` + unlink any stale socket (safe: we hold the lock, so no live engine serves on
 it) → open database (migrations run here; the engine is the sole migration runner) → bind `UnixListener` (nonblocking),
 chmod socket `0600` → build `multi_thread` runtime (named threads, blocking pool capped to the storage lanes) → serve
@@ -140,8 +144,8 @@ Shutdown (order matters — the final checkpoint must not race in-flight writes)
    `wal_checkpoint(TRUNCATE)`. The lane drain makes this deterministic.
 6. Release the lock last, after the checkpoint proves the DB is quiesced.
 
-Exit codes: `0` clean, `1` runtime/forced, `2` config, `3` already running (lock held),
-`4` service-manager failure. launchd/systemd restart policies key off these.
+Exit codes: `0` clean, `1` runtime/forced, `2` config, `3` already running (lock held).
+launchd/systemd restart policies key off these.
 
 ## Wire contract (`valqeron-proto`)
 
@@ -200,37 +204,46 @@ classify into `NotRunning`/`Unreachable`/`Rpc`.
 
 ## Environment & files
 
+The engine binary takes **no arguments**; the variables below — set in the service definition — are its entire
+configuration surface (each falls back to a platform default when unset):
+
 | Var / file                                | Owner            | Meaning                                                                             |
 |-------------------------------------------|------------------|-------------------------------------------------------------------------------------|
-| `VALQERON_DB`                             | engine only      | database path (flag > env > `<data dir>/valqeron.db`)                               |
+| `VALQERON_DB`                             | engine only      | database path (env > `<data dir>/valqeron.db`)                                      |
 | `VALQERON_SOCKET`                         | engine + clients | UDS path; must resolve identically on both sides                                    |
 | `VALQERON_ENGINE_LOG_FILE` / `_LOG_LEVEL` | engine           | JSON log file (`off` disables) / file level                                         |
+| `VALQERON_ENGINE_DURABLE`                 | engine           | truthy = strict durability (`PRAGMA synchronous=FULL`); default relaxed (`NORMAL`)  |
+| `VALQERON_ENGINE_MAINTENANCE_INTERVAL`    | engine           | seconds between maintenance runs (default 3600); non-numeric = refuse to start      |
+| `VALQERON_ENGINE_HEARTBEAT_INTERVAL`      | engine           | seconds between heartbeat log lines (default 300); non-numeric = refuse to start    |
+| `RUST_LOG`                                | engine           | stderr filter override (default `info`)                                             |
 | `VALQERON_LOG_FILE` / `_LOG_LEVEL`        | CLI              | same semantics, CLI's own file                                                      |
 | `<db>.lock`                               | engine           | exclusive advisory flock = single-instance authority; PID inside is diagnostic only |
 | `valqeron.sock`                           | engine           | unlinked on clean exit; stale files removed at startup under the lock               |
 
 ## Service management
 
-`install`/`uninstall` render embedded templates (launchd LaunchAgent on macOS, systemd user unit on Linux) with
-`{{PLACEHOLDER}}` substitution; explicit `--db-path`/`--socket` overrides are propagated into the unit environment
-(`%`-escaped against systemd specifier expansion), and the systemd sandbox is punched through for the db, socket, and
-log directories. The systemd unit is `Type=notify`: startup completes only when the engine reports `READY=1`
-(serving), and `STOPPING=1` announces shutdown.
+Installation/upgrade is a **separate lifecycle** from the engine binary: the daemon takes no arguments — it just runs
+and stops on a signal; registering it with a service manager happens at deployment time, owned today by the development recipes
+`just engine-install` / `just engine-uninstall` (and by real packaging later) — see the decision note in
+[internals.md](internals.md).
 
-Registration deliberately lives in the binary, not in shell scripts: the unit's sandbox paths and environment must
-match the engine's own resolution exactly, and the template must ship in lockstep with the behavior it declares
-(`Type=notify` ⇔ sd_notify) — see the decision note in [internals.md](internals.md). The transparency a script would
-offer comes from `install --print`, which renders the exact definition (all paths resolved) to stdout and changes
-nothing.
+The service definition is a static, machine-local file under `scripts/install/` — copy the committed
+`.example` next to it once (`io.valqeron.engine.plist` on macOS, `valqeron-engine.service` on Linux) and edit the
+`CHANGE-ME` paths; the copy is gitignored and is the single source of truth for binary path, log paths, and
+`VALQERON_DB`/`VALQERON_SOCKET`/`VALQERON_ENGINE_LOG_FILE` overrides. `engine-install` builds the release binary,
+copies the definition into place (`~/Library/LaunchAgents/io.valqeron.engine.plist` /
+`~/.config/systemd/user/valqeron-engine.service`), and re-registers it. Re-registration is serialized so **at most one
+engine process exists at any time**: on macOS the recipe waits after `launchctl bootout` until launchd has reaped the
+old process and dropped the registration before `bootstrap` (bootout is asynchronous; bootstrapping into a live
+teardown overlaps two engines and the db-lock loser churns through `KeepAlive` respawns), and on Linux
+`systemctl --user restart` serializes stop-then-start, bounded by `TimeoutStopSec`. The systemd unit is `Type=notify`:
+startup completes only when the engine reports `READY=1` (serving), and `STOPPING=1` announces shutdown.
+`engine-uninstall` stops the service (waiting for the same full teardown) and removes the installed definition; the
+machine-local file under `scripts/install/` stays.
 
-Install semantics: re-running `install` with an unchanged configuration is an idempotent no-op that only ensures
-registration (it never restarts a running engine); a divergent existing definition demands `--force`.
-`install --no-start` writes and registers without starting — a running instance keeps its previous definition until
-restarted.
-
-`status` probes the lock PID + service registration (reporting db, lock, socket, and unit-file paths) and exits
-non-zero when stopped (liveness probe); `status --json` emits one machine-readable object with the same exit-code
-contract.
+Runtime diagnostics live in the client: `valqeron engine ping` (health/version handshake round-trip) and
+`valqeron engine status` (engine version, protocol version, db path, uptime, pid) probe a *running* engine over the
+socket; a stopped engine surfaces as the typed `engine/not-running` problem.
 
 ## Extending
 

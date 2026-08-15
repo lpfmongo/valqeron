@@ -38,8 +38,8 @@ impl std::fmt::Display for EngineProblem {
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error(
-        "no engine is running on {socket}; start it with `valqeron-engine run` \
-         or install it with `valqeron-engine install`"
+        "no engine is running on {socket}; install and start the engine service \
+         (during development: `just engine-install`)"
     )]
     NotRunning { socket: PathBuf },
 

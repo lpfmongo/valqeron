@@ -1,0 +1,53 @@
+# Development systemd user unit for the Valqeron engine.
+#
+# One-time setup:
+#   cp scripts/install/valqeron-engine.service.example scripts/install/valqeron-engine.service
+# then edit every CHANGE-ME below (absolute paths; %h = $HOME and
+# %t = $XDG_RUNTIME_DIR are expanded by systemd).
+#
+# `just engine-install` copies the edited file to ~/.config/systemd/user/ and
+# enables + restarts it. The copy under scripts/install/ is gitignored because
+# its contents (binary path, environment) are machine-specific.
+
+[Unit]
+Description=Valqeron engine daemon
+Documentation=https://github.com/lfreitas2012/valqeron
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# The engine sends READY=1 (serving) and STOPPING=1 over $NOTIFY_SOCKET;
+# startup completes only once the socket is bound and the gRPC server runs.
+Type=notify
+# The binary takes no arguments: configuration comes entirely from the
+# VALQERON_* environment variables below.
+ExecStart="/CHANGE-ME/valqeron/target/release/valqeron-engine"
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+# Must exceed the engine's internal drain (10s) + runtime shutdown (20s)
+# bounds so a graceful stop is never truncated mid-checkpoint.
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Creates $XDG_RUNTIME_DIR/valqeron for the default socket location.
+RuntimeDirectory=valqeron
+# Writable paths at the engine's defaults: data dir (db + log) and socket dir.
+# Extend this list if you override any of the VALQERON_* paths below.
+ReadWritePaths=%h/.local/share/valqeron %t/valqeron
+# Optional overrides, shown at the engine's own defaults. Uncomment to
+# customize. Intervals are whole seconds; VALQERON_ENGINE_LOG_FILE=off
+# disables the JSON file log; a truthy VALQERON_ENGINE_DURABLE (e.g. 1)
+# switches writes to strict durability (PRAGMA synchronous=FULL, slower).
+# Environment="VALQERON_DB=%h/.local/share/valqeron/valqeron.db"
+# Environment="VALQERON_SOCKET=%t/valqeron/valqeron.sock"
+# Environment="VALQERON_ENGINE_LOG_FILE=%h/.local/share/valqeron/engine.log"
+# Environment="VALQERON_ENGINE_LOG_LEVEL=info"
+# Environment="VALQERON_ENGINE_DURABLE=0"
+# Environment="VALQERON_ENGINE_MAINTENANCE_INTERVAL=3600"
+# Environment="VALQERON_ENGINE_HEARTBEAT_INTERVAL=300"
+
+[Install]
+WantedBy=default.target

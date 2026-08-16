@@ -1,10 +1,14 @@
+mod calendar;
 mod common;
 mod identifiers;
 mod issuer;
 mod listing;
+mod schedule;
 mod security;
 mod storage;
+mod sync;
 mod task;
+mod task_registration;
 mod venue;
 
 pub use common::{LoadMode, Loading, RepositoryResult, Versioned, WriteOutcome};
@@ -93,4 +97,26 @@ pub use task::{
     BackgroundTask, BackgroundTaskBuilder, BackgroundTaskSnapshot, TaskCompletion, TaskId,
     TaskKind, TaskStatus,
     error::{TaskBuilderError, TaskKindError, TaskStatusError},
+};
+
+pub use calendar::MarketCalendar;
+
+pub use schedule::{Recurrence, Schedule, TargetPeriod};
+
+pub use sync::repository::SyncCursorRepository;
+
+pub use sync::{
+    SyncCursor, SyncCursorSnapshot, SyncOutcome, SyncOutcomeKind, SyncSource,
+    cooldown::CooldownPolicy,
+    error::{SyncOutcomeKindError, SyncSourceError},
+};
+
+pub use task_registration::repository::TaskRegistrationRepository;
+
+pub use task_registration::service::{TaskStatusEntry, list_task_statuses};
+
+pub use task_registration::{
+    DerivedTaskStatus, LogPolicy, RunOutcome, TaskCategory, TaskDeclaration, TaskRegistration,
+    TaskRegistrationSnapshot, TaskTier, TaskTracking, derive_status,
+    error::{LogPolicyError, RunOutcomeError, TaskCategoryError, TaskTierError, TaskTrackingError},
 };

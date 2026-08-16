@@ -27,10 +27,10 @@ fn watchdog_interval_from(
     my_pid: u32,
 ) -> Option<Duration> {
     let usec = usec?;
-    if let Some(pid) = pid {
-        if pid.to_str().and_then(|s| s.trim().parse::<u32>().ok()) != Some(my_pid) {
-            return None;
-        }
+    if let Some(pid) = pid
+        && pid.to_str().and_then(|s| s.trim().parse::<u32>().ok()) != Some(my_pid)
+    {
+        return None;
     }
     match usec.to_str().and_then(|s| s.trim().parse::<u64>().ok()) {
         Some(micros) if micros > 0 => Some(Duration::from_micros(micros)),

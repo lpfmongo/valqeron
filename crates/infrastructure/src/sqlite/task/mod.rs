@@ -1,4 +1,4 @@
-mod mapping;
+pub(crate) mod mapping;
 mod model;
 mod queries;
 mod repository;

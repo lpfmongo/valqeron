@@ -10,6 +10,7 @@
 
 mod engine;
 mod grpc;
+mod jobs;
 mod lifecycle;
 mod notify;
 mod storage;

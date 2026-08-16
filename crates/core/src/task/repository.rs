@@ -25,6 +25,19 @@ pub trait BackgroundTaskRepository {
     /// piles up or runs overlapped.
     fn exists_active(&self, kind: &TaskKind) -> RepositoryResult<bool>;
 
+    /// The earliest non-terminal (`Pending`/`Running`) row of `kind` — the
+    /// task's next (or current) run, for status derivation.
+    fn find_active(&self, kind: &TaskKind) -> RepositoryResult<Option<Versioned<BackgroundTask>>>;
+
+    /// Terminally fail every `Pending` row of `kind` with `error` (retired
+    /// kinds at boot reconcile). Returns how many rows were cancelled.
+    fn fail_pending(
+        &self,
+        kind: &TaskKind,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> RepositoryResult<u32>;
+
     /// Atomically claim up to `limit` due `Pending` tasks (oldest due first):
     /// each becomes `Running` with `attempts + 1`, `started_at = now`, and a
     /// bumped version. Returns the claimed rows in their post-claim state.
@@ -71,6 +84,20 @@ macro_rules! delegate_background_task_repository {
             }
             fn exists_active(&self, kind: &TaskKind) -> RepositoryResult<bool> {
                 (**self).exists_active(kind)
+            }
+            fn find_active(
+                &self,
+                kind: &TaskKind,
+            ) -> RepositoryResult<Option<Versioned<BackgroundTask>>> {
+                (**self).find_active(kind)
+            }
+            fn fail_pending(
+                &self,
+                kind: &TaskKind,
+                error: &str,
+                now: DateTime<Utc>,
+            ) -> RepositoryResult<u32> {
+                (**self).fail_pending(kind, error, now)
             }
             fn claim_due(
                 &self,

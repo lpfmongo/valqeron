@@ -12,3 +12,6 @@
 /scripts/install/valqeron-engine.service
 
 .DS_Store
+
+### Documentation ###
+/docs/book/

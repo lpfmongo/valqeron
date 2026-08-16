@@ -610,6 +610,38 @@ mod db_tests {
     }
 
     #[test]
+    fn v3_database_upgrades_to_latest_with_the_new_engine_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+
+        // Build a genuine v3 database: apply the first three migrations by
+        // hand and stamp the version, exactly as an engine at v3 left it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in MIGRATIONS.iter().take(3) {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+
+        let mut conn = Connection::open(&path).unwrap();
+        migrations::run(&mut conn).unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        for table in ["sync_cursor", "task_registration"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table} exists and is empty");
+        }
+    }
+
+    #[test]
     fn schema_from_the_future_is_rejected_rather_than_silently_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(dir.path().join("future.db")).unwrap();

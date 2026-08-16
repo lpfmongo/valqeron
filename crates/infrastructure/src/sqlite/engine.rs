@@ -5,7 +5,9 @@ use valqeron_core::{Repositories, StorageEngine, StorageError};
 use crate::sqlite::database::{Database, DatabaseConfig, WalCheckpointStats};
 use crate::sqlite::issuer::SqliteIssuerRepository;
 use crate::sqlite::security::SqliteSecurityRepository;
+use crate::sqlite::sync_cursor::SqliteSyncCursorRepository;
 use crate::sqlite::task::SqliteBackgroundTaskRepository;
+use crate::sqlite::task_registration::SqliteTaskRegistrationRepository;
 
 pub struct SqliteStorageEngine {
     db: Database,
@@ -39,12 +41,16 @@ impl StorageEngine for SqliteStorageEngine {
     type Issuers = SqliteIssuerRepository;
     type Securities = SqliteSecurityRepository;
     type Tasks = SqliteBackgroundTaskRepository;
+    type Cursors = SqliteSyncCursorRepository;
+    type Registry = SqliteTaskRegistrationRepository;
 
     fn repositories(&self) -> Repositories<Self> {
         Repositories {
             issuers: SqliteIssuerRepository::new(self.db.handle()),
             securities: SqliteSecurityRepository::new(self.db.handle()),
             tasks: SqliteBackgroundTaskRepository::new(self.db.handle()),
+            cursors: SqliteSyncCursorRepository::new(self.db.handle()),
+            registry: SqliteTaskRegistrationRepository::new(self.db.handle()),
         }
     }
 
@@ -57,6 +63,8 @@ impl StorageEngine for SqliteStorageEngine {
                 issuers: SqliteIssuerRepository::new(handle.clone()),
                 securities: SqliteSecurityRepository::new(handle.clone()),
                 tasks: SqliteBackgroundTaskRepository::new(handle.clone()),
+                cursors: SqliteSyncCursorRepository::new(handle.clone()),
+                registry: SqliteTaskRegistrationRepository::new(handle.clone()),
             };
             f(&repositories)
         })

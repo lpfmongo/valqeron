@@ -45,3 +45,16 @@ pub(crate) fn column_datetime(row: &Row, name: &str) -> rusqlite::Result<DateTim
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| conversion_failure(column_index(row, name), Type::Text, e))
 }
+
+pub(crate) fn column_opt_datetime(
+    row: &Row,
+    name: &str,
+) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    let raw: Option<String> = row.get(name)?;
+    raw.map(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| conversion_failure(column_index(row, name), Type::Text, e))
+    })
+    .transpose()
+}

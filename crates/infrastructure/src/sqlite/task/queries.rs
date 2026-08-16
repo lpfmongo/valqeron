@@ -60,6 +60,41 @@ pub(crate) fn list_recent(conn: &Connection, limit: u32) -> rusqlite::Result<Vec
     stmt.query_map(params![limit], TaskRow::from_row)?.collect()
 }
 
+/// The earliest non-terminal row of `kind`: the next (or currently
+/// running) run.
+pub(crate) fn find_active(
+    conn: &Connection,
+    kind: &valqeron_core::TaskKind,
+) -> rusqlite::Result<Option<TaskRow>> {
+    let sql = format!(
+        "SELECT {TASK_COLUMNS} FROM background_task
+         WHERE kind = ?1 AND status IN ('PENDING', 'RUNNING')
+         ORDER BY scheduled_at, id LIMIT 1"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.query_row(params![kind.as_str()], TaskRow::from_row)
+        .optional()
+}
+
+/// Terminally fail every `PENDING` row of `kind` (retired-kind cleanup).
+pub(crate) fn fail_pending(
+    conn: &Connection,
+    kind: &valqeron_core::TaskKind,
+    error: &str,
+    now: DateTime<Utc>,
+) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE background_task SET
+            status      = 'FAILED',
+            last_error  = ?2,
+            finished_at = ?3,
+            updated_at  = ?3,
+            version     = version + 1
+         WHERE kind = ?1 AND status = 'PENDING'",
+    )?;
+    stmt.execute(params![kind.as_str(), error, canonical_timestamp(now)])
+}
+
 pub(crate) fn exists_active(
     conn: &Connection,
     kind: &valqeron_core::TaskKind,

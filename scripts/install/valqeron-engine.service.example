@@ -52,6 +52,14 @@ ReadWritePaths=%h/.local/share/valqeron %t/valqeron
 # Environment="VALQERON_ENGINE_DURABLE=0"
 # Environment="VALQERON_ENGINE_MAINTENANCE_INTERVAL=3600"
 # Environment="VALQERON_ENGINE_HEARTBEAT_INTERVAL=300"
+# CVM daily sync: VALQERON_ENGINE_SYNC_CVM=off disables; _AT is market-local
+# HH:MM (America/Sao_Paulo); _SCHEDULE is "daily" or "weekly:<mon..sun>";
+# _COOLDOWN is the failure-cooldown base in seconds.
+# Environment="VALQERON_ENGINE_SYNC_CVM=on"
+# Environment="VALQERON_ENGINE_SYNC_CVM_AT=07:00"
+# Environment="VALQERON_ENGINE_SYNC_CVM_SCHEDULE=daily"
+# Environment="VALQERON_ENGINE_SYNC_CVM_COOLDOWN=300"
+# Environment="VALQERON_ENGINE_SYNC_MAX_BACKFILL_DAYS=90"
 
 [Install]
 WantedBy=default.target

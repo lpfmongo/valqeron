@@ -1,10 +1,8 @@
 use rusqlite::Row;
 use valqeron_core::{BackgroundTaskSnapshot, Versioned};
 
-use crate::sqlite::row::{FromRow, column_datetime};
-use crate::sqlite::task::mapping::{
-    column_opt_datetime, column_task_id, column_task_kind, column_task_status,
-};
+use crate::sqlite::row::{FromRow, column_datetime, column_opt_datetime};
+use crate::sqlite::task::mapping::{column_task_id, column_task_kind, column_task_status};
 
 /// One `background_task` row, mapped to the snapshot so the repository can
 /// reconstitute the entity without exposing column details.

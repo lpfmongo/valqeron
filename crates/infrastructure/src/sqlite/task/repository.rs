@@ -56,6 +56,27 @@ impl BackgroundTaskRepository for SqliteBackgroundTaskRepository {
         queries::exists_active(&conn, kind).map_err(backend)
     }
 
+    fn find_active(&self, kind: &TaskKind) -> RepositoryResult<Option<Versioned<BackgroundTask>>> {
+        let conn = self.db.read();
+        Ok(queries::find_active(&conn, kind)
+            .map_err(backend)?
+            .map(reconstitute))
+    }
+
+    fn fail_pending(
+        &self,
+        kind: &TaskKind,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> RepositoryResult<u32> {
+        with_busy_retry(|| {
+            let conn = self.db.write();
+            let cancelled = queries::fail_pending(&conn, kind, error, now)?;
+            Ok(u32::try_from(cancelled).unwrap_or(u32::MAX))
+        })
+        .map_err(backend)
+    }
+
     fn claim_due(
         &self,
         now: DateTime<Utc>,

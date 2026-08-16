@@ -41,6 +41,20 @@ deps-check:
 fuzz-all:
     just --justfile crates/identifiers/Justfile fuzz-all
 
+# Build the engineering docs (mdBook) into docs/book
+docs-build:
+    cargo install mdbook mdbook-mermaid --locked
+    mdbook build docs
+
+# Serve the engineering docs with live reload on http://localhost:3000
+docs-serve:
+    mdbook serve docs --open
+
+# Verify the docs build cleanly and no code fence is an accidental doctest
+docs-check:
+    mdbook build docs
+    mdbook test docs
+
 # Installation is a separate lifecycle from the engine binary itself; this
 # recipe is the development stand-in for future packaging. The service
 # definition is a static, machine-local file under scripts/install/ — copy the

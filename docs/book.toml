@@ -1,4 +1,19 @@
 [book]
-title = "Valqeron"
+title = "Valqeron Engineering Docs"
 authors = ["Leonardo Freitas"]
 language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/anomalyco/valqeron"
+edit-url-template = "https://github.com/anomalyco/valqeron/edit/main/docs/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.fold]
+enable = true
+level = 1
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

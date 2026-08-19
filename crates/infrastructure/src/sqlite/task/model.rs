@@ -4,7 +4,7 @@ use valqeron_core::{BackgroundTaskSnapshot, Versioned};
 use crate::sqlite::row::{FromRow, column_datetime, column_opt_datetime};
 use crate::sqlite::task::mapping::{column_task_id, column_task_kind, column_task_status};
 
-/// One `background_task` row, mapped to the snapshot so the repository can
+/// One `task_queue` row, mapped to the snapshot so the repository can
 /// reconstitute the entity without exposing column details.
 #[derive(Debug)]
 pub(crate) struct TaskRow(pub Versioned<BackgroundTaskSnapshot>);
@@ -24,7 +24,6 @@ impl FromRow for TaskRow {
             payload: row.get("payload")?,
             scheduled_at: column_datetime(row, "scheduled_at")?,
             started_at: column_opt_datetime(row, "started_at")?,
-            finished_at: column_opt_datetime(row, "finished_at")?,
             attempts: row.get("attempts")?,
             max_attempts: row.get("max_attempts")?,
             retry_delay_secs: row.get("retry_delay_secs")?,

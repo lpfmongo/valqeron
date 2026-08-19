@@ -3,20 +3,18 @@
 //! Runs every business day at the configured America/Sao_Paulo time and
 //! targets the previous business day ("Friday syncs Thursday, Monday syncs
 //! Friday"), with full sequential catch-up after downtime — all provided by
-//! the sync plane. The handler is a placeholder: it logs the period it
+//! the sync trigger. The handler is a placeholder: it logs the period it
 //! would ingest and reports `Done`, which advances the cursor. Real
 //! ingestion (and this module's own tables + repositories) lands later and
 //! changes only this file.
 
 use chrono::{NaiveTime, SecondsFormat};
-use valqeron_core::{
-    CooldownPolicy, LogPolicy, MarketCalendar, Recurrence, Schedule, SyncSource, TaskCategory,
-    TaskDeclaration, TaskKind, TaskTier, TaskTracking,
-};
+use valqeron_core::{MarketCalendar, Recurrence, Schedule, SyncSource};
 
 use crate::engine::{DEFAULT_SYNC_AT, EngineConfig};
-use crate::tasks::plane::{PlaneConfig, RetryPolicy, RunWindow, TaskOutcome};
-use crate::tasks::{BackgroundTasksBuilder, TaskSpec};
+use crate::tasks::{
+    BackgroundTasksBuilder, RetryPolicy, RunWindow, TaskContext, TaskDefinition, TaskOutcome,
+};
 
 pub(crate) const CVM_DAILY_SYNC_TASK: &str = "cvm_daily_sync";
 
@@ -25,7 +23,8 @@ pub(crate) const CVM_SYNC_SOURCE: &str = "cvm";
 
 /// Task-level retries of one CVM run: transient faults get three attempts
 /// five minutes apart before the failure is terminal (and the cursor-level
-/// cooldown takes over).
+/// cooldown takes over). Identical to the framework default, restated here
+/// because CVM's cadence was tuned deliberately.
 const CVM_SYNC_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 3,
     retry_delay_secs: 300,
@@ -54,36 +53,24 @@ pub(crate) fn register(
             source = CVM_SYNC_SOURCE,
             "CVM sync disabled via environment"
         );
-        let Ok(kind) = TaskKind::new(CVM_DAILY_SYNC_TASK) else {
-            return builder;
-        };
-        let default_schedule = Schedule::new(MarketCalendar::B3, default_at(), Recurrence::Daily);
-        return builder.declare_disabled(TaskDeclaration {
-            kind,
-            category: TaskCategory::FinanceDataSync,
-            tier: TaskTier::Sync,
-            tracking: TaskTracking::Durable,
-            schedule: format!("sync:{}", default_schedule.descriptor()),
-            source: Some(source),
-            log_policy: LogPolicy::All,
-            config_enabled: false,
-        });
+        let schedule = Schedule::new(MarketCalendar::B3, default_at(), Recurrence::Daily);
+        return builder.declare(
+            TaskDefinition::sync(CVM_DAILY_SYNC_TASK, source, schedule)
+                .retry(CVM_SYNC_RETRY)
+                .disabled(),
+        );
     };
 
-    builder.register(
-        TaskSpec {
-            kind: CVM_DAILY_SYNC_TASK,
-            category: TaskCategory::FinanceDataSync,
-            plane: PlaneConfig::Sync {
-                source,
-                schedule: Schedule::new(MarketCalendar::B3, settings.at, settings.recurrence),
-                retry: CVM_SYNC_RETRY,
-                cooldown: CooldownPolicy::new(settings.cooldown_secs),
-                max_backfill_days: settings.max_backfill_days,
-            },
-            log_policy: LogPolicy::All,
-        },
-        |ctx| async move {
+    builder.task(
+        TaskDefinition::sync(
+            CVM_DAILY_SYNC_TASK,
+            source,
+            Schedule::new(MarketCalendar::B3, settings.at, settings.recurrence),
+        )
+        .retry(CVM_SYNC_RETRY)
+        .cooldown_secs(settings.cooldown_secs)
+        .max_backfill_days(settings.max_backfill_days)
+        .run(|ctx: TaskContext| async move {
             let RunWindow::Period { slot, target } = ctx.window else {
                 return TaskOutcome::Failed("cvm sync run without a period window".into());
             };
@@ -97,6 +84,6 @@ pub(crate) fn register(
                 "CVM daily sync placeholder — no ingestion implemented yet"
             );
             TaskOutcome::Done
-        },
+        }),
     )
 }

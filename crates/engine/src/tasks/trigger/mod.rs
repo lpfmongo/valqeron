@@ -1,9 +1,9 @@
-//! Execution planes: the tier semantics behind background tasks.
+//! Execution triggers: the tier semantics behind background tasks.
 //!
 //! The task manager is a generic kernel — catalog, seeding loops, dispatch,
 //! completion recording. Everything a *tier* means (monotonic intervals,
 //! wall-clock recurrence, cursor-driven sync with catch-up) lives behind
-//! the [`Plane`] trait in this module tree, and everything a *task* means
+//! the [`Trigger`] trait in this module tree, and everything a *task* means
 //! lives behind the handler contract ([`TaskContext`] → [`TaskOutcome`]).
 //! The manager never sees cursors, payload formats, or tier state.
 
@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use valqeron_core::{
-    CooldownPolicy, Repositories, Schedule, StorageError, SyncSource, TargetPeriod, TaskTier,
-    TaskTracking,
+    CooldownPolicy, Repositories, Schedule, StorageError, SyncSource, TargetPeriod, TaskTracking,
+    TaskTrigger,
 };
 use valqeron_infrastructure::SqliteStorageEngine;
 
@@ -33,7 +33,7 @@ pub(crate) const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ================ HANDLER CONTRACT ================
-/// Execution context handed to a handler. The manager and the planes parse
+/// Execution context handed to a handler. The manager and the triggers parse
 /// everything; handlers receive typed values only.
 pub(crate) struct TaskContext {
     pub storage: AsyncStorage,
@@ -55,7 +55,7 @@ pub(crate) enum RunWindow {
 }
 
 /// How a handler reports one run. One vocabulary for every tier; each
-/// plane interprets it (sync holds its cursor on `NotReady`, the simpler
+/// trigger interprets it (sync holds its cursor on `NotReady`, the simpler
 /// tiers just log — their retry is the next occurrence).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TaskOutcome {
@@ -72,6 +72,19 @@ pub(crate) enum TaskOutcome {
         retry_after_secs: u32,
     },
     Failed(String),
+}
+
+// ================ INTERPRETATION ================
+/// What a completed handler run meant, after the trigger applied its side
+/// effects — this is what the execution history records. `NotReady` is a
+/// first-class result ("waited" is not "worked"), never a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Interpretation {
+    /// The run did its work (the sync trigger advanced its cursor).
+    Completed,
+    /// The run could not proceed yet (the sync trigger held its cursor and
+    /// set a cooldown).
+    NotReady,
 }
 
 // ================ FAILURE ================
@@ -93,7 +106,7 @@ impl std::fmt::Display for TaskFailure {
 }
 
 // ================ REGISTRATION CONFIG ================
-/// Whether a plane's runs are persisted as `background_task` rows
+/// Whether a trigger's runs are persisted as `background_task` rows
 /// (history, retries visible) or executed purely in memory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tracking {
@@ -121,7 +134,7 @@ impl RetryPolicy {
 
 /// Everything the manager needs to know about a task's tier — and nothing
 /// more.
-pub(crate) enum PlaneConfig {
+pub(crate) enum TriggerConfig {
     /// Monotonic interval since boot (liveness and housekeeping work).
     Interval {
         period: Duration,
@@ -148,18 +161,18 @@ pub(crate) enum PlaneConfig {
     },
 }
 
-impl PlaneConfig {
-    pub fn tier(&self) -> TaskTier {
+impl TriggerConfig {
+    pub fn trigger_kind(&self) -> TaskTrigger {
         match self {
-            PlaneConfig::Interval { .. } => TaskTier::Interval,
-            PlaneConfig::Recurring { .. } => TaskTier::Recurring,
-            PlaneConfig::Sync { .. } => TaskTier::Sync,
+            TriggerConfig::Interval { .. } => TaskTrigger::Interval,
+            TriggerConfig::Recurring { .. } => TaskTrigger::Recurring,
+            TriggerConfig::Sync { .. } => TaskTrigger::Sync,
         }
     }
 
     pub fn tracking(&self) -> TaskTracking {
         match self {
-            PlaneConfig::Interval {
+            TriggerConfig::Interval {
                 tracking: Tracking::Ephemeral,
                 ..
             } => TaskTracking::Ephemeral,
@@ -169,7 +182,7 @@ impl PlaneConfig {
 
     pub fn source(&self) -> Option<SyncSource> {
         match self {
-            PlaneConfig::Sync { source, .. } => Some(source.clone()),
+            TriggerConfig::Sync { source, .. } => Some(source.clone()),
             _ => None,
         }
     }
@@ -177,7 +190,7 @@ impl PlaneConfig {
     /// Canonical schedule descriptor for the catalog, display-only.
     pub fn descriptor(&self) -> String {
         match self {
-            PlaneConfig::Interval { period, jitter, .. } => {
+            TriggerConfig::Interval { period, jitter, .. } => {
                 let secs = period.as_secs();
                 if *jitter {
                     format!("interval:{secs}s±10%")
@@ -185,16 +198,16 @@ impl PlaneConfig {
                     format!("interval:{secs}s")
                 }
             }
-            PlaneConfig::Recurring { schedule, .. } => {
+            TriggerConfig::Recurring { schedule, .. } => {
                 format!("recurring:{}", schedule.descriptor())
             }
-            PlaneConfig::Sync { schedule, .. } => format!("sync:{}", schedule.descriptor()),
+            TriggerConfig::Sync { schedule, .. } => format!("sync:{}", schedule.descriptor()),
         }
     }
 }
 
 // ================ SEEDING ================
-/// How a plane's seeder ticks are executed.
+/// How a trigger's seeder ticks are executed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TickMode {
     /// Each tick may seed a durable row (inside one write transaction).
@@ -210,15 +223,15 @@ pub(crate) enum SeedPass {
     Seeded,
     /// Nothing to do (active run, cooldown, future slot already armed…).
     Idle,
-    /// Operator-paused (produced by the manager's gate, not by planes).
+    /// Operator-paused (produced by the manager's gate, not by triggers).
     Paused,
 }
 
 // ================ THE TRAIT ================
 /// One tier's scheduling semantics. Implementations own their state
-/// (the sync plane owns the cursor and the payload format); the manager
+/// (the sync trigger owns the cursor and the payload format); the manager
 /// only orchestrates.
-pub(crate) trait Plane: Send + Sync {
+pub(crate) trait Trigger: Send + Sync {
     /// Seeder loop cadence: (first tick, period), computed at spawn time.
     fn cadence(&self) -> (tokio::time::Instant, Duration);
 
@@ -237,14 +250,15 @@ pub(crate) trait Plane: Send + Sync {
     fn window_for(&self, payload: Option<&str>) -> Result<RunWindow, String>;
 
     /// Interpret the handler's outcome, applying tier side effects (the
-    /// sync plane advances or holds its cursor here). `Err` feeds the
-    /// dispatcher's retry machinery.
+    /// sync trigger advances or holds its cursor here). `Ok` carries what the
+    /// execution history should record; `Err` feeds the dispatcher's retry
+    /// machinery.
     fn interpret<'a>(
         &'a self,
         storage: &'a AsyncStorage,
         window: RunWindow,
         outcome: TaskOutcome,
-    ) -> BoxFuture<'a, Result<(), TaskFailure>>;
+    ) -> BoxFuture<'a, Result<Interpretation, TaskFailure>>;
 
     /// Called after a run's *final* attempt failed and was recorded.
     fn on_terminal<'a>(&'a self, storage: &'a AsyncStorage, error: String) -> BoxFuture<'a, ()>;
@@ -253,28 +267,30 @@ pub(crate) trait Plane: Send + Sync {
     fn wake(&self);
 
     /// Resolves when the seeder should re-evaluate ahead of its ticker;
-    /// planes without wake-ups never resolve.
+    /// triggers without wake-ups never resolve.
     fn wake_notified<'a>(&'a self) -> BoxFuture<'a, ()>;
 }
 
-/// Build the plane runtime for one registration.
-pub(crate) fn build(kind: &'static str, config: PlaneConfig) -> Arc<dyn Plane> {
+/// Build the trigger runtime for one registration.
+pub(crate) fn build(kind: &'static str, config: TriggerConfig) -> Arc<dyn Trigger> {
     match config {
-        PlaneConfig::Interval {
+        TriggerConfig::Interval {
             period,
             jitter,
             tracking,
-        } => Arc::new(interval::IntervalPlane::new(kind, period, jitter, tracking)),
-        PlaneConfig::Recurring { schedule, retry } => {
-            Arc::new(recurring::RecurringPlane::new(kind, schedule, retry))
+        } => Arc::new(interval::IntervalTrigger::new(
+            kind, period, jitter, tracking,
+        )),
+        TriggerConfig::Recurring { schedule, retry } => {
+            Arc::new(recurring::RecurringTrigger::new(kind, schedule, retry))
         }
-        PlaneConfig::Sync {
+        TriggerConfig::Sync {
             source,
             schedule,
             retry,
             cooldown,
             max_backfill_days,
-        } => Arc::new(sync::SyncPlane::new(
+        } => Arc::new(sync::SyncTrigger::new(
             kind,
             source,
             schedule,
@@ -293,17 +309,17 @@ mod tests {
 
     #[test]
     fn descriptors_render_per_tier() {
-        let interval = PlaneConfig::Interval {
+        let interval = TriggerConfig::Interval {
             period: Duration::from_secs(3600),
             jitter: true,
             tracking: Tracking::Durable,
         };
         assert_eq!(interval.descriptor(), "interval:3600s±10%");
-        assert_eq!(interval.tier(), TaskTier::Interval);
+        assert_eq!(interval.trigger_kind(), TaskTrigger::Interval);
         assert_eq!(interval.tracking(), TaskTracking::Durable);
         assert_eq!(interval.source(), None);
 
-        let plain = PlaneConfig::Interval {
+        let plain = TriggerConfig::Interval {
             period: Duration::from_secs(300),
             jitter: false,
             tracking: Tracking::Ephemeral,
@@ -316,14 +332,14 @@ mod tests {
             NaiveTime::from_hms_opt(3, 0, 0).unwrap(),
             Recurrence::Daily,
         );
-        let recurring = PlaneConfig::Recurring {
+        let recurring = TriggerConfig::Recurring {
             schedule,
             retry: RetryPolicy::none(),
         };
         assert_eq!(recurring.descriptor(), "recurring:daily@03:00+00:00");
         assert_eq!(recurring.tracking(), TaskTracking::Durable);
 
-        let sync = PlaneConfig::Sync {
+        let sync = TriggerConfig::Sync {
             source: SyncSource::new("cvm").unwrap(),
             schedule: Schedule::new(
                 MarketCalendar::B3,
@@ -335,7 +351,7 @@ mod tests {
             max_backfill_days: 90,
         };
         assert_eq!(sync.descriptor(), "sync:daily@07:00-03:00");
-        assert_eq!(sync.tier(), TaskTier::Sync);
+        assert_eq!(sync.trigger_kind(), TaskTrigger::Sync);
         assert_eq!(
             sync.source().map(|s| s.as_str().to_owned()),
             Some("cvm".into())

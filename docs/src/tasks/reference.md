@@ -8,35 +8,25 @@
 | `CLAIM_BATCH` | 8 | `tasks/mod.rs` | Rows claimed per write-lane call |
 | `EXECUTION_CONCURRENCY` | 2 | `tasks/mod.rs` | Concurrent handlers per batch |
 | `RETIRED_ERROR` | `"retired: kind no longer registered"` | `tasks/mod.rs` | Recorded on cancelled rows |
-| `RECONCILE_INTERVAL` | 60s | `plane/mod.rs` | Wall-clock seeder fallback tick |
-| `ESCALATE_AFTER_FAILURES` | 5 | `plane/sync.rs` | `warn` → `error`; the `halted` threshold |
-| `MAX_BACKOFF` | 1h | `core/task.rs` | Retry backoff cap |
-| `MAX_COOLDOWN` | 1h | `core/sync/cooldown.rs` | Sync cooldown cap |
-| `TASK_KIND_MAX_LEN` | 100 | `core/task.rs` | Kind length limit |
+| `INTERRUPTED_ERROR` | `"interrupted: the engine stopped…"` | `tasks/mod.rs` | Recorded by crash recovery |
+| `RECONCILE_INTERVAL` | 60s | `tasks/trigger/mod.rs` | Wall-clock seeder fallback tick |
+| `ESCALATE_AFTER_FAILURES` | 5 | `tasks/trigger/sync.rs` | `warn` → `error`; the `halted` threshold |
+| Sync builder defaults | 3×300s retry · 300s cooldown · 90d cap | `tasks/task.rs` | Every source inherits them unless overridden |
+| `MAX_BACKOFF` | 1h | `core/src/tasks` | Retry backoff cap |
+| `MAX_COOLDOWN` | 1h | `core/src/tasks` | Sync cooldown cap |
+| `TASK_KIND_MAX_LEN` | 100 | `core/src/tasks` | Kind length limit |
 | `MAX_SCAN_DAYS` | 366 / 400 | `core/calendar.rs`, `core/schedule.rs` | Bounded calendar scans |
 | `TASK_RETENTION_DAYS` | 7 | `jobs/system.rs` | History kept before pruning |
 | `TASK_PRUNE_AT` | 03:00 UTC | `jobs/system.rs` | Prune occurrence |
 | `DRAIN_TIMEOUT` | 10s | `engine.rs` | Graceful shutdown budget |
 | `RUNTIME_SHUTDOWN_TIMEOUT` | 20s | `engine.rs` | Blocking-pool drain bound |
 
-## Environment variables
-
-| Variable | Default | Invalid value |
-|---|---|---|
-| `VALQERON_ENGINE_MAINTENANCE_INTERVAL` | `3600` | refuse to start |
-| `VALQERON_ENGINE_HEARTBEAT_INTERVAL` | `300` | refuse to start |
-| `VALQERON_ENGINE_SYNC_CVM` | enabled | — (`off`/`false`/`0`/`none` disables) |
-| `VALQERON_ENGINE_SYNC_CVM_AT` | `07:00` | refuse to start |
-| `VALQERON_ENGINE_SYNC_CVM_SCHEDULE` | `daily` | refuse to start |
-| `VALQERON_ENGINE_SYNC_CVM_COOLDOWN` | `300` | refuse to start |
-| `VALQERON_ENGINE_SYNC_MAX_BACKFILL_DAYS` | `90` | refuse to start |
-
-Unset or empty always means "use the default"; only a *set, non-empty, invalid*
-value is fatal.
+Environment variables are documented in [Operations § Configuration](./operations.md#configuration); audit events in
+[Operations § Logging control](./operations.md#logging-control).
 
 ## Built-in tasks
 
-| Kind | Category | Plane | Descriptor | Tracking | Log policy |
+| Kind | Category | Trigger | Descriptor | Tracking | Log policy |
 |---|---|---|---|---|---|
 | `db_maintenance` | ENGINE_SYSTEM | Interval | `interval:3600s±10%` | Durable | ALL |
 | `heartbeat` | ENGINE_SYSTEM | Interval | `interval:300s` | Ephemeral | FAILURES_ONLY |
@@ -49,18 +39,18 @@ value is fatal.
 | Type | Values |
 |---|---|
 | `TaskCategory` | `ENGINE_SYSTEM`, `FINANCE_DATA_SYNC`, `OTHER` |
-| `TaskTier` | `INTERVAL`, `RECURRING`, `SYNC` |
+| `TaskTrigger` | `INTERVAL`, `RECURRING`, `SYNC` |
 | `TaskTracking` | `DURABLE`, `EPHEMERAL` |
 | `LogPolicy` | `ALL`, `FAILURES_ONLY` |
-| `RunOutcome` | `SUCCEEDED`, `FAILED` |
-| `TaskStatus` | `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED` |
-| `SyncOutcomeKind` | `SYNCED`, `NOT_READY`, `FAILED` |
+| `TaskStatus` (queue) | `PENDING`, `RUNNING` — terminal states live in the history, not the queue |
+| `ExecutionOutcome` (history + stats) | `SUCCEEDED`, `NOT_READY`, `FAILED` |
+| `SyncOutcomeKind` (cursor) | `SYNCED`, `NOT_READY`, `FAILED` |
 | `DerivedTaskStatus` | `retired`, `disabled`, `paused`, `running`, `halted`, `cooling_down`, `catching_up`, `waiting`, `due`, `idle` |
 | `Recurrence` | `Daily`, `Weekly { on: Weekday }` |
 
 ## Schedule descriptors
 
-| Plane | Format | Example |
+| Trigger | Format | Example |
 |---|---|---|
 | Interval | `interval:{secs}s` | `interval:300s` |
 | Interval + jitter | `interval:{secs}s±10%` | `interval:3600s±10%` |
@@ -71,107 +61,106 @@ Display-only; never parsed back.
 
 ## Tables
 
-| Table | Migration | Purpose | Pruned |
-|---|---|---|---|
-| `background_task` | 003 | Queue + run history | after 7 days (terminal rows) |
-| `sync_cursor` | 004 | Per-source sync progress | never |
-| `task_registration` | 005 | Task catalog + intent + summary | never |
+| Table | Migration | Purpose | Pruned | Schema shown in |
+|---|---|---|---|---|
+| `task_registry` | 006 | Catalog: declaration + operator intent | never | [Architecture § The data model](./architecture.md#the-data-model) |
+| `task_queue` | 006 | Live work only (`PENDING`/`RUNNING`) | never needs it — terminal runs leave | — |
+| `task_execution` | 006 | Terminal run history | after 7 days | — |
+| `task_stat` | 006 | Prune-proof per-kind aggregates | never | — |
+| `sync_cursor` | 004 | Per-source sync progress | never | [Triggers § Sync](./triggers.md#sync) |
 
-All `STRICT, WITHOUT ROWID`, in the same SQLite file as domain data.
-
-### `background_task` indexes
+All `STRICT, WITHOUT ROWID`, in the same SQLite file as domain data. Migration 006 reorganized the original fused
+`background_task` + `task_registration` pair into the four task tables, carrying all data over.
 
 ```sql
-idx_background_task_due  (status, scheduled_at)   -- claim_due
-idx_background_task_kind (kind, scheduled_at)     -- exists_active, find_active
+-- task_queue indexes
+idx_task_queue_due  (status, scheduled_at)   -- claim_due
+idx_task_queue_kind (kind, scheduled_at)     -- exists_active, find_active
+
+-- task_execution indexes
+idx_task_execution_kind     (kind, finished_at)   -- recent runs per kind
+idx_task_execution_finished (finished_at)         -- retention pruning
 ```
 
-### Timestamp format
-
-RFC 3339, millisecond precision, `Z`-suffixed UTC —
-`2026-08-12T10:00:00.000Z`. Uniform, so lexicographic `TEXT` comparison is time
-order. Civil dates use `NaiveDate`'s canonical `YYYY-MM-DD`.
+Timestamps are RFC 3339, millisecond precision, `Z`-suffixed UTC — `2026-08-12T10:00:00.000Z` — uniform, so
+lexicographic `TEXT` comparison is time order. Civil dates use `NaiveDate`'s canonical `YYYY-MM-DD`.
 
 ## Repository ports
 
+All five live in `crates/core/src/tasks/repository.rs`:
+
 | Port | Key methods |
 |---|---|
-| `BackgroundTaskRepository` | `insert`, `claim_due`, `complete`, `exists_active`, `find_active`, `fail_pending`, `reset_stale_running`, `prune_finished`, `list_recent`, `find_by_id` |
-| `SyncCursorRepository` | `get`, `upsert` |
-| `TaskRegistrationRepository` | `declare`, `retire_missing`, `get`, `list`, `is_paused`, `set_paused`, `record_run` |
+| `BackgroundTaskRepository` (queue) | `insert`, `claim_due`, `complete` (Terminal = guarded DELETE, Retry = UPDATE), `exists_active`, `find_active`, `find_by_id`, `list_queued`, `take_pending`, `requeue_interrupted`, `take_exhausted_running` |
+| `TaskExecutionRepository` (history) | `insert`, `find_by_id`, `list_recent`, `prune_finished` |
+| `TaskStatRepository` (aggregates) | `record_run`, `get`, `list` |
+| `TaskRegistrationRepository` (catalog) | `declare`, `retire_missing`, `get`, `list`, `is_paused`, `set_paused` |
+| `SyncCursorRepository` (progress) | `get`, `upsert` |
 
-Each carries `#[cfg_attr(test, mockall::automock)]` **and** a hand-written
-`delegate_*!` macro for `Box`/`Rc`/`Arc` — a trait change must update both.
-
-## Audit operations
-
-`task_registry_reconcile` · `task_seed` · `task_run` · `task_recovery` ·
-`task_prune` · `db_maintenance` · `sync_seed` · `sync_not_ready` · `sync_skip` ·
-`sync_halted`
-
-All under `target = "valqeron::audit"`.
+Each carries `#[cfg_attr(test, mockall::automock)]` **and** a hand-written `delegate_*!` macro for `Box`/`Rc`/`Arc` — a
+trait change must update both.
 
 ## File map
 
 ```text
-crates/core/src/
-  calendar.rs              MarketCalendar, business-day math
-  schedule.rs              Recurrence, Schedule, TargetPeriod, descriptors
-  task.rs                  BackgroundTask, retry arithmetic
-  task/repository.rs       queue port
-  sync.rs                  SyncCursor, SyncOutcome, SyncSource
-  sync/cooldown.rs         CooldownPolicy
-  sync/repository.rs       cursor port
-  task_registration.rs     catalog entity, derive_status
-  task_registration/service.rs   list_task_statuses (read model)
+crates/core/src/tasks/
+  mod.rs                   the whole domain: queue entity + retry arithmetic,
+                           execution + stats records, catalog entity,
+                           derive_status + the status read model,
+                           sync cursor + cooldown policy
+  error.rs                 every task error enum
+  repository.rs            the five ports + mocks + delegates
 
 crates/infrastructure/src/sqlite/
-  task/                    background_task adapter
+  task/                    task_queue adapter
+  task_execution/          task_execution adapter
+  task_stat/               task_stat adapter
+  task_registration/       task_registry adapter
   sync_cursor/             sync_cursor adapter
-  task_registration/       task_registration adapter
   migrations.rs            MIGRATIONS array (index = schema version)
 
 crates/engine/src/
-  tasks/mod.rs             manager kernel
-  tasks/plane/mod.rs       Plane trait, contract types
-  tasks/plane/interval.rs
-  tasks/plane/recurring.rs
-  tasks/plane/sync.rs
+  tasks/mod.rs             the facade: BackgroundTasks(Builder),
+                           TaskWorkerManager (stoppable seeders + dispatcher),
+                           TaskContextRunner (storage gateway + execution)
+  tasks/task.rs            TaskDefinition + typed builders + TaskHandler
+  tasks/trigger/           PRIVATE — trait Trigger + interval/recurring/sync
   jobs/system.rs           ENGINE_SYSTEM tasks
   jobs/cvm.rs              CVM sync source
   engine.rs                composition + config resolution
 
 migrations/
-  003_create_background_task_schema.sql
+  003_create_background_task_schema.sql    superseded by 006
   004_create_sync_cursor_schema.sql
-  005_create_task_registration_schema.sql
+  005_create_task_registration_schema.sql  superseded by 006
+  006_reorganize_task_schema.sql           the four task tables
 ```
 
 ## Invariants
 
-1. `core` and `infrastructure` stay free of tokio/tonic — enforced by
-   `just deps-check`.
-2. `tasks/` imports nothing from `jobs/`; the manager imports nothing
-   tier-specific from `plane/sync.rs` beyond the trait object.
-3. A migration requires both the `.sql` file **and** an append to `MIGRATIONS`;
-   the array index is the schema version.
-4. Engine tables share one SQLite file with domain data — required for atomic
-   data + cursor commits (WAL cannot commit across attached files).
-5. Every durable plane gates on `exists_active`: one run per kind in flight.
-6. The pause gate and the plane's reconcile share one transaction.
-7. Completion and `record_run` share one transaction.
-8. Status is derived, never stored.
+1. `core` and `infrastructure` stay free of tokio/tonic — enforced by `just deps-check`.
+2. `crate::tasks` is the only door: `trigger/` is private, `tasks/` imports nothing from `jobs/`, and a grep for `cvm`
+   in `tasks/` returns only test fixture strings.
+3. A migration requires both the `.sql` file **and** an append to `MIGRATIONS`; the array index is the schema version.
+4. Engine tables share one SQLite file with domain data — required for atomic data + cursor commits (WAL cannot commit
+   across attached files).
+5. Every durable trigger gates on `exists_active`: one run per kind in flight.
+6. The pause gate and the trigger's reconcile share one transaction.
+7. A terminal completion is one transaction: guarded queue delete + history insert + stats fold — applied only when the
+   delete matched.
+8. Status is derived, never stored; stats are folded forward, never recomputed from history.
 9. Sync handlers must be idempotent (at-least-once execution).
 10. Handlers derive dates from `RunWindow`, never from the clock.
+11. Stats count *runs*: recovery-interrupted terminal rows count; retirement cancellations do not.
 
 ## Not yet built
 
 | Item | Notes |
 |---|---|
-| `ListTasks` RPC + `vq engine tasks` | Additive proto change; no `PROTOCOL_VERSION` bump |
-| Pause/resume RPC | Would also enable cancelling an armed row on pause |
+| `ListTasks` RPC + `vq engine tasks` | `BackgroundTasks::statuses()` is the in-process read model; additive proto change, no `PROTOCOL_VERSION` bump |
+| Pause/resume RPC | Flip `paused` + `kick(kind)`; worker `stop`/`start` already exist for runtime control |
 | One-shot range backfill | `backfill_run` table + one reconciler branch |
 | B3 holiday calendar | Seam is `MarketCalendar::is_business_day` |
-| Real CVM ingestion | Changes only `jobs/cvm.rs` (+ its own tables) |
+| Real CVM ingestion | Changes only `jobs/cvm.rs` (+ its own tables); the handler becomes a struct `TaskHandler` |
 | DB-driven schedule overrides | Env remains the config source today |
 | IANA timezones | Fixed offsets today; exact for Brazil (no DST since 2019) |

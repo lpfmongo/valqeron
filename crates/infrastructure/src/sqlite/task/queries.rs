@@ -1,4 +1,8 @@
-//! Cached statements for the `background_task` table.
+//! Cached statements for the `task_queue` table — live work only.
+//!
+//! Terminal completions are version-guarded DELETEs: the row moves to
+//! `task_execution` (inserted by the caller in the same transaction), so
+//! the queue never accumulates dead rows and the due-scan index stays hot.
 //!
 //! Time comparisons rely on the canonical persisted timestamp form
 //! ([`canonical_timestamp`]): RFC 3339, millisecond precision, Z-suffixed
@@ -12,21 +16,16 @@ use crate::sqlite::row::{FromRow, canonical_timestamp};
 use crate::sqlite::task::mapping::status_as_str;
 use crate::sqlite::task::model::TaskRow;
 
-const TASK_COLUMNS: &str = "id, kind, status, payload, scheduled_at, started_at, finished_at, \
+const TASK_COLUMNS: &str = "id, kind, status, payload, scheduled_at, started_at, \
                             attempts, max_attempts, retry_delay_secs, last_error, created_at, \
                             updated_at, version";
 
-/// Message recorded on rows found `RUNNING` at startup: the previous process
-/// stopped (crash or overrun drain) before the run could be completed.
-pub(crate) const INTERRUPTED_ERROR: &str =
-    "interrupted: the engine stopped while the task was running";
-
 pub(crate) fn insert(conn: &Connection, task: &BackgroundTask) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO background_task (id, kind, status, payload, scheduled_at, started_at, \
-                                      finished_at, attempts, max_attempts, retry_delay_secs, \
-                                      last_error, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO task_queue (id, kind, status, payload, scheduled_at, started_at, \
+                                 attempts, max_attempts, retry_delay_secs, \
+                                 last_error, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
     stmt.execute(params![
         task.id().as_bytes(),
@@ -35,7 +34,6 @@ pub(crate) fn insert(conn: &Connection, task: &BackgroundTask) -> rusqlite::Resu
         task.payload(),
         canonical_timestamp(task.scheduled_at()),
         task.started_at().map(canonical_timestamp),
-        task.finished_at().map(canonical_timestamp),
         task.attempts(),
         task.max_attempts(),
         task.retry_delay_secs(),
@@ -46,29 +44,27 @@ pub(crate) fn insert(conn: &Connection, task: &BackgroundTask) -> rusqlite::Resu
 }
 
 pub(crate) fn find_by_id(conn: &Connection, id: &TaskId) -> rusqlite::Result<Option<TaskRow>> {
-    let sql = format!("SELECT {TASK_COLUMNS} FROM background_task WHERE id = ?1");
+    let sql = format!("SELECT {TASK_COLUMNS} FROM task_queue WHERE id = ?1");
     let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_row(params![id.as_bytes()], TaskRow::from_row)
         .optional()
 }
 
-pub(crate) fn list_recent(conn: &Connection, limit: u32) -> rusqlite::Result<Vec<TaskRow>> {
-    let sql = format!(
-        "SELECT {TASK_COLUMNS} FROM background_task ORDER BY scheduled_at DESC, id DESC LIMIT ?1"
-    );
+/// Every queued row, soonest first.
+pub(crate) fn list_queued(conn: &Connection, limit: u32) -> rusqlite::Result<Vec<TaskRow>> {
+    let sql = format!("SELECT {TASK_COLUMNS} FROM task_queue ORDER BY scheduled_at, id LIMIT ?1");
     let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_map(params![limit], TaskRow::from_row)?.collect()
 }
 
-/// The earliest non-terminal row of `kind`: the next (or currently
-/// running) run.
+/// The earliest row of `kind`: the next (or currently running) run.
 pub(crate) fn find_active(
     conn: &Connection,
     kind: &valqeron_core::TaskKind,
 ) -> rusqlite::Result<Option<TaskRow>> {
     let sql = format!(
-        "SELECT {TASK_COLUMNS} FROM background_task
-         WHERE kind = ?1 AND status IN ('PENDING', 'RUNNING')
+        "SELECT {TASK_COLUMNS} FROM task_queue
+         WHERE kind = ?1
          ORDER BY scheduled_at, id LIMIT 1"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -76,33 +72,36 @@ pub(crate) fn find_active(
         .optional()
 }
 
-/// Terminally fail every `PENDING` row of `kind` (retired-kind cleanup).
-pub(crate) fn fail_pending(
+/// The `PENDING` rows of `kind`, oldest first (retired-kind cleanup reads
+/// them before deleting).
+pub(crate) fn pending_rows(
     conn: &Connection,
     kind: &valqeron_core::TaskKind,
-    error: &str,
-    now: DateTime<Utc>,
+) -> rusqlite::Result<Vec<TaskRow>> {
+    let sql = format!(
+        "SELECT {TASK_COLUMNS} FROM task_queue
+         WHERE kind = ?1 AND status = 'PENDING'
+         ORDER BY scheduled_at, id"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.query_map(params![kind.as_str()], TaskRow::from_row)?
+        .collect()
+}
+
+pub(crate) fn delete_pending(
+    conn: &Connection,
+    kind: &valqeron_core::TaskKind,
 ) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare_cached(
-        "UPDATE background_task SET
-            status      = 'FAILED',
-            last_error  = ?2,
-            finished_at = ?3,
-            updated_at  = ?3,
-            version     = version + 1
-         WHERE kind = ?1 AND status = 'PENDING'",
-    )?;
-    stmt.execute(params![kind.as_str(), error, canonical_timestamp(now)])
+    let mut stmt =
+        conn.prepare_cached("DELETE FROM task_queue WHERE kind = ?1 AND status = 'PENDING'")?;
+    stmt.execute(params![kind.as_str()])
 }
 
 pub(crate) fn exists_active(
     conn: &Connection,
     kind: &valqeron_core::TaskKind,
 ) -> rusqlite::Result<bool> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT 1 FROM background_task
-         WHERE kind = ?1 AND status IN ('PENDING', 'RUNNING') LIMIT 1",
-    )?;
+    let mut stmt = conn.prepare_cached("SELECT 1 FROM task_queue WHERE kind = ?1 LIMIT 1")?;
     stmt.query_row(params![kind.as_str()], |_| Ok(()))
         .optional()
         .map(|found| found.is_some())
@@ -116,7 +115,7 @@ pub(crate) fn due_ids(
     limit: u32,
 ) -> rusqlite::Result<Vec<TaskId>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id FROM background_task
+        "SELECT id FROM task_queue
          WHERE status = 'PENDING' AND scheduled_at <= ?1
          ORDER BY scheduled_at, id LIMIT ?2",
     )?;
@@ -137,7 +136,7 @@ pub(crate) fn mark_running(
     now: DateTime<Utc>,
 ) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "UPDATE background_task SET
+        "UPDATE task_queue SET
             status = 'RUNNING',
             attempts = attempts + 1,
             started_at = ?2,
@@ -148,26 +147,15 @@ pub(crate) fn mark_running(
     stmt.execute(params![id.as_bytes(), canonical_timestamp(now)])
 }
 
-pub(crate) fn complete_succeeded(
+/// Terminal completion: the run leaves the queue. Version-guarded so a
+/// stale completion cannot delete a row someone else has since touched.
+pub(crate) fn delete_completed(
     conn: &Connection,
     id: &TaskId,
     expected_version: u32,
-    finished_at: DateTime<Utc>,
 ) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare_cached(
-        "UPDATE background_task SET
-            status = 'SUCCEEDED',
-            finished_at = ?2,
-            updated_at = ?2,
-            last_error = NULL,
-            version = version + 1
-         WHERE id = ?1 AND version = ?3",
-    )?;
-    stmt.execute(params![
-        id.as_bytes(),
-        canonical_timestamp(finished_at),
-        expected_version,
-    ])
+    let mut stmt = conn.prepare_cached("DELETE FROM task_queue WHERE id = ?1 AND version = ?2")?;
+    stmt.execute(params![id.as_bytes(), expected_version])
 }
 
 pub(crate) fn complete_retry(
@@ -179,7 +167,7 @@ pub(crate) fn complete_retry(
     retry_at: DateTime<Utc>,
 ) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "UPDATE background_task SET
+        "UPDATE task_queue SET
             status = 'PENDING',
             scheduled_at = ?2,
             updated_at = ?3,
@@ -196,56 +184,15 @@ pub(crate) fn complete_retry(
     ])
 }
 
-pub(crate) fn complete_failed(
-    conn: &Connection,
-    id: &TaskId,
-    expected_version: u32,
-    error: &str,
-    finished_at: DateTime<Utc>,
-) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare_cached(
-        "UPDATE background_task SET
-            status = 'FAILED',
-            finished_at = ?2,
-            updated_at = ?2,
-            last_error = ?3,
-            version = version + 1
-         WHERE id = ?1 AND version = ?4",
-    )?;
-    stmt.execute(params![
-        id.as_bytes(),
-        canonical_timestamp(finished_at),
-        error,
-        expected_version,
-    ])
-}
-
-/// Startup recovery, half 1: orphaned `RUNNING` rows that already spent their
-/// final attempt become terminal `FAILED`.
-pub(crate) fn fail_exhausted_running(
-    conn: &Connection,
-    now: DateTime<Utc>,
-) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare_cached(
-        "UPDATE background_task SET
-            status = 'FAILED',
-            finished_at = ?1,
-            updated_at = ?1,
-            last_error = ?2,
-            version = version + 1
-         WHERE status = 'RUNNING' AND attempts >= max_attempts",
-    )?;
-    stmt.execute(params![canonical_timestamp(now), INTERRUPTED_ERROR])
-}
-
-/// Startup recovery, half 2: orphaned `RUNNING` rows with attempts left go
-/// back to `PENDING`, due immediately.
+/// Startup recovery, half 1: orphaned `RUNNING` rows with attempts left go
+/// back to `PENDING`, due immediately, with the caller's error recorded.
 pub(crate) fn requeue_interrupted_running(
     conn: &Connection,
+    error: &str,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "UPDATE background_task SET
+        "UPDATE task_queue SET
             status = 'PENDING',
             scheduled_at = ?1,
             updated_at = ?1,
@@ -253,24 +200,32 @@ pub(crate) fn requeue_interrupted_running(
             version = version + 1
          WHERE status = 'RUNNING' AND attempts < max_attempts",
     )?;
-    stmt.execute(params![canonical_timestamp(now), INTERRUPTED_ERROR])
+    stmt.execute(params![canonical_timestamp(now), error])
 }
 
-pub(crate) fn prune_finished(
-    conn: &Connection,
-    older_than: DateTime<Utc>,
-) -> rusqlite::Result<usize> {
+/// Startup recovery, half 2a: the orphaned `RUNNING` rows already on their
+/// final attempt (read before deletion so the caller can record them).
+pub(crate) fn exhausted_running_rows(conn: &Connection) -> rusqlite::Result<Vec<TaskRow>> {
+    let sql = format!(
+        "SELECT {TASK_COLUMNS} FROM task_queue
+         WHERE status = 'RUNNING' AND attempts >= max_attempts
+         ORDER BY scheduled_at, id"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.query_map([], TaskRow::from_row)?.collect()
+}
+
+/// Startup recovery, half 2b: drop the exhausted rows read by
+/// [`exhausted_running_rows`].
+pub(crate) fn delete_exhausted_running(conn: &Connection) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "DELETE FROM background_task
-         WHERE status IN ('SUCCEEDED', 'FAILED')
-           AND finished_at IS NOT NULL
-           AND finished_at < ?1",
+        "DELETE FROM task_queue WHERE status = 'RUNNING' AND attempts >= max_attempts",
     )?;
-    stmt.execute(params![canonical_timestamp(older_than)])
+    stmt.execute([])
 }
 
-/// Kept for parity with the other adapters' guarded-write disambiguation.
-pub(crate) const TASK_VERSION_SQL: &str = "SELECT version FROM background_task WHERE id = ?1";
+/// Disambiguates a zero-row guarded write: version mismatch vs. missing.
+pub(crate) const TASK_VERSION_SQL: &str = "SELECT version FROM task_queue WHERE id = ?1";
 
 /// Count of rows per kind, used by tests.
 #[cfg(test)]
@@ -278,6 +233,6 @@ pub(crate) fn count_by_kind(
     conn: &Connection,
     kind: &valqeron_core::TaskKind,
 ) -> rusqlite::Result<u32> {
-    let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM background_task WHERE kind = ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM task_queue WHERE kind = ?1")?;
     stmt.query_row(params![kind.as_str()], |row| row.get(0))
 }

@@ -1,4 +1,4 @@
-//! The interval plane: monotonic ticks since boot, for liveness and
+//! The interval trigger: monotonic ticks since boot, for liveness and
 //! housekeeping work where "every N seconds of uptime" is the right
 //! semantic. Durable ticks seed an immediately-due row (gated so one kind
 //! never piles up); ephemeral ticks run inline with no persistence.
@@ -12,19 +12,19 @@ use valqeron_core::{
 use valqeron_infrastructure::SqliteStorageEngine;
 
 use crate::storage::AsyncStorage;
-use crate::tasks::plane::{
-    BoxFuture, Plane, RetryPolicy, RunWindow, SeedPass, TaskFailure, TaskOutcome, TickMode,
-    Tracking,
+use crate::tasks::trigger::{
+    BoxFuture, Interpretation, RetryPolicy, RunWindow, SeedPass, TaskFailure, TaskOutcome,
+    TickMode, Tracking, Trigger,
 };
 
-pub(crate) struct IntervalPlane {
+pub(crate) struct IntervalTrigger {
     kind: &'static str,
     period: Duration,
     jitter: bool,
     tracking: Tracking,
 }
 
-impl IntervalPlane {
+impl IntervalTrigger {
     pub(crate) fn new(
         kind: &'static str,
         period: Duration,
@@ -40,7 +40,7 @@ impl IntervalPlane {
     }
 }
 
-impl Plane for IntervalPlane {
+impl Trigger for IntervalTrigger {
     fn cadence(&self) -> (tokio::time::Instant, Duration) {
         let period = if self.jitter {
             jittered(self.period)
@@ -93,10 +93,10 @@ impl Plane for IntervalPlane {
         _storage: &'a AsyncStorage,
         _window: RunWindow,
         outcome: TaskOutcome,
-    ) -> BoxFuture<'a, Result<(), TaskFailure>> {
+    ) -> BoxFuture<'a, Result<Interpretation, TaskFailure>> {
         Box::pin(async move {
             match outcome {
-                TaskOutcome::Done => Ok(()),
+                TaskOutcome::Done => Ok(Interpretation::Completed),
                 TaskOutcome::NotReady { retry_after_secs } => {
                     // No cursor to hold: the retry is simply the next tick.
                     tracing::info!(
@@ -104,7 +104,7 @@ impl Plane for IntervalPlane {
                         retry_after_secs,
                         "run reported not-ready; the next interval tick retries"
                     );
-                    Ok(())
+                    Ok(Interpretation::NotReady)
                 }
                 TaskOutcome::Failed(error) => Err(TaskFailure::new(error)),
             }
@@ -166,9 +166,10 @@ mod tests {
 
     #[test]
     fn modes_follow_tracking() {
-        let durable = IntervalPlane::new("t", Duration::from_secs(1), false, Tracking::Durable);
+        let durable = IntervalTrigger::new("t", Duration::from_secs(1), false, Tracking::Durable);
         assert_eq!(durable.mode(), TickMode::Seed);
-        let ephemeral = IntervalPlane::new("t", Duration::from_secs(1), false, Tracking::Ephemeral);
+        let ephemeral =
+            IntervalTrigger::new("t", Duration::from_secs(1), false, Tracking::Ephemeral);
         assert_eq!(ephemeral.mode(), TickMode::Inline);
         assert!(matches!(ephemeral.window_for(None), Ok(RunWindow::None)));
     }

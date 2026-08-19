@@ -1,7 +1,7 @@
 use crate::grpc::{AdminGrpc, IssuerGrpc};
 use crate::lifecycle::{Lifecycle, LifecycleState};
 use crate::storage::AsyncStorage;
-use crate::tasks::{BackgroundTasksBuilder, BackgroundTasksManager};
+use crate::tasks::{BackgroundTasks, BackgroundTasksBuilder};
 use chrono::{NaiveTime, Weekday};
 use directories::ProjectDirs;
 use std::ffi::OsString;
@@ -816,7 +816,7 @@ fn background_tasks(
     started: Instant,
     state: watch::Receiver<LifecycleState>,
 ) -> BackgroundTasksBuilder {
-    let builder = BackgroundTasksManager::builder();
+    let builder = BackgroundTasks::builder();
     let builder = crate::jobs::system::register(builder, config, started, state);
     crate::jobs::cvm::register(builder, config)
 }
@@ -889,7 +889,7 @@ async fn run_loop(
 async fn graceful_shutdown(
     mut signals: Signals,
     mut server: GrpcServer,
-    tasks: BackgroundTasksManager,
+    tasks: BackgroundTasks,
     storage: &AsyncStorage,
 ) -> EngineResult<()> {
     server.begin_shutdown();

@@ -1,8 +1,9 @@
 use crate::issuer::repository::IssuerRepository;
 use crate::security::repository::SecurityRepository;
-use crate::sync::repository::SyncCursorRepository;
-use crate::task::repository::BackgroundTaskRepository;
-use crate::task_registration::repository::TaskRegistrationRepository;
+use crate::tasks::repository::{
+    BackgroundTaskRepository, SyncCursorRepository, TaskExecutionRepository,
+    TaskRegistrationRepository, TaskStatRepository,
+};
 
 mod error;
 
@@ -12,6 +13,8 @@ pub struct Repositories<E: StorageEngine> {
     pub issuers: E::Issuers,
     pub securities: E::Securities,
     pub tasks: E::Tasks,
+    pub executions: E::Executions,
+    pub stats: E::Stats,
     pub cursors: E::Cursors,
     pub registry: E::Registry,
 }
@@ -20,6 +23,8 @@ pub trait StorageEngine: Sized + Send + Sync {
     type Issuers: IssuerRepository;
     type Securities: SecurityRepository;
     type Tasks: BackgroundTaskRepository;
+    type Executions: TaskExecutionRepository;
+    type Stats: TaskStatRepository;
     type Cursors: SyncCursorRepository;
     type Registry: TaskRegistrationRepository;
 

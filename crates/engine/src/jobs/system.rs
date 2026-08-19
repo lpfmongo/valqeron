@@ -5,24 +5,23 @@ use std::time::Instant;
 use chrono::NaiveTime;
 use tokio::sync::watch;
 use valqeron_core::{
-    BackgroundTaskRepository, LogPolicy, MarketCalendar, Recurrence, Schedule, StorageError,
-    TaskCategory,
+    MarketCalendar, Recurrence, Schedule, StorageError, TaskCategory, TaskExecutionRepository,
 };
 use valqeron_infrastructure::SqliteStorageEngine;
 
 use crate::engine::EngineConfig;
 use crate::lifecycle::LifecycleState;
-use crate::tasks::plane::{PlaneConfig, RetryPolicy, TaskOutcome, Tracking};
-use crate::tasks::{BackgroundTasksBuilder, TaskSpec};
+use crate::tasks::{BackgroundTasksBuilder, TaskContext, TaskDefinition, TaskOutcome};
 
 /// Task kinds this module registers — also the `kind` values persisted in
-/// the `background_task` table (the ephemeral kinds never persist rows).
+/// the task tables (the ephemeral kinds never persist rows).
 pub(crate) const DB_MAINTENANCE_TASK: &str = "db_maintenance";
 pub(crate) const HEARTBEAT_TASK: &str = "heartbeat";
 pub(crate) const TASK_PRUNE_TASK: &str = "task_prune";
 pub(crate) const SD_WATCHDOG_TASK: &str = "sd_watchdog";
 
-/// How long terminal task rows are kept before `task_prune` deletes them.
+/// How long execution-history rows are kept before `task_prune` deletes
+/// them.
 const TASK_RETENTION_DAYS: i64 = 7;
 
 /// Wall-clock time of day (UTC) `task_prune` recurs at. Recurring — not a
@@ -37,8 +36,8 @@ fn task_prune_at() -> NaiveTime {
 }
 
 /// Register the engine's built-in system tasks: durable database
-/// maintenance, the wall-clock task-history prune, the ephemeral heartbeat,
-/// and (under a systemd watchdog) the ephemeral watchdog ping.
+/// maintenance, the wall-clock history prune, the ephemeral heartbeat, and
+/// (under a systemd watchdog) the ephemeral watchdog ping.
 pub(crate) fn register(
     builder: BackgroundTasksBuilder,
     config: &EngineConfig,
@@ -46,69 +45,46 @@ pub(crate) fn register(
     state: watch::Receiver<LifecycleState>,
 ) -> BackgroundTasksBuilder {
     let builder = builder
-        .register(
-            TaskSpec {
-                kind: DB_MAINTENANCE_TASK,
-                category: TaskCategory::EngineSystem,
-                plane: PlaneConfig::Interval {
-                    period: config.maintenance_interval(),
-                    jitter: true,
-                    tracking: Tracking::Durable,
-                },
-                log_policy: LogPolicy::All,
-            },
-            |ctx| async move {
-                match ctx
-                    .storage
-                    .maintenance(DB_MAINTENANCE_TASK, run_maintenance_job)
-                    .await
-                {
-                    Ok(Ok(())) => TaskOutcome::Done,
-                    Ok(Err(e)) => TaskOutcome::Failed(e),
-                    Err(e) => TaskOutcome::Failed(e.to_string()),
-                }
-            },
+        .task(
+            TaskDefinition::interval(DB_MAINTENANCE_TASK, config.maintenance_interval())
+                .category(TaskCategory::EngineSystem)
+                .run(|ctx: TaskContext| async move {
+                    match ctx
+                        .storage
+                        .maintenance(DB_MAINTENANCE_TASK, run_maintenance_job)
+                        .await
+                    {
+                        Ok(Ok(())) => TaskOutcome::Done,
+                        Ok(Err(e)) => TaskOutcome::Failed(e),
+                        Err(e) => TaskOutcome::Failed(e.to_string()),
+                    }
+                }),
         )
-        .register(
-            TaskSpec {
-                kind: HEARTBEAT_TASK,
-                category: TaskCategory::EngineSystem,
-                plane: PlaneConfig::Interval {
-                    period: config.heartbeat_interval(),
-                    jitter: false,
-                    tracking: Tracking::Ephemeral,
-                },
-                log_policy: LogPolicy::FailuresOnly,
-            },
-            move |_ctx| {
-                let state = state.clone();
-                async move {
-                    let current = *state.borrow();
-                    tracing::debug!(
-                        job = "heartbeat",
-                        state = current.as_str(),
-                        uptime_secs = started.elapsed().as_secs(),
-                        "engine alive"
-                    );
-                    TaskOutcome::Done
-                }
-            },
+        .task(
+            TaskDefinition::interval(HEARTBEAT_TASK, config.heartbeat_interval())
+                .category(TaskCategory::EngineSystem)
+                .ephemeral()
+                .run(move |_ctx: TaskContext| {
+                    let state = state.clone();
+                    async move {
+                        let current = *state.borrow();
+                        tracing::debug!(
+                            job = "heartbeat",
+                            state = current.as_str(),
+                            uptime_secs = started.elapsed().as_secs(),
+                            "engine alive"
+                        );
+                        TaskOutcome::Done
+                    }
+                }),
         )
-        .register(
-            TaskSpec {
-                kind: TASK_PRUNE_TASK,
-                category: TaskCategory::EngineSystem,
-                plane: PlaneConfig::Recurring {
-                    schedule: Schedule::new(
-                        MarketCalendar::UTC,
-                        task_prune_at(),
-                        Recurrence::Daily,
-                    ),
-                    retry: RetryPolicy::none(),
-                },
-                log_policy: LogPolicy::All,
-            },
-            |ctx| async move {
+        .task(
+            TaskDefinition::recurring(
+                TASK_PRUNE_TASK,
+                Schedule::new(MarketCalendar::UTC, task_prune_at(), Recurrence::Daily),
+            )
+            .category(TaskCategory::EngineSystem)
+            .run(|ctx: TaskContext| async move {
                 let Some(cutoff) = chrono::Utc::now()
                     .checked_sub_signed(chrono::Duration::days(TASK_RETENTION_DAYS))
                 else {
@@ -119,7 +95,7 @@ pub(crate) fn register(
                     .storage
                     .write(TASK_PRUNE_TASK, false, move |repos| {
                         repos
-                            .tasks
+                            .executions
                             .prune_finished(cutoff)
                             .map_err(StorageError::from)
                     })
@@ -131,14 +107,14 @@ pub(crate) fn register(
                             operation = "task_prune",
                             removed,
                             retention_days = TASK_RETENTION_DAYS,
-                            "pruned terminal background task rows"
+                            "pruned terminal background task executions"
                         );
                         TaskOutcome::Done
                     }
                     Ok(Err(e)) => TaskOutcome::Failed(e.to_string()),
                     Err(e) => TaskOutcome::Failed(e.to_string()),
                 }
-            },
+            }),
         );
 
     // Under a systemd watchdog (WatchdogSec= in the unit), ping WATCHDOG=1
@@ -153,21 +129,14 @@ pub(crate) fn register(
         ping_every_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX),
         "systemd watchdog armed; pinging at half the interval"
     );
-    builder.register(
-        TaskSpec {
-            kind: SD_WATCHDOG_TASK,
-            category: TaskCategory::EngineSystem,
-            plane: PlaneConfig::Interval {
-                period,
-                jitter: false,
-                tracking: Tracking::Ephemeral,
-            },
-            log_policy: LogPolicy::FailuresOnly,
-        },
-        |_ctx| async {
-            crate::notify::notify_watchdog();
-            TaskOutcome::Done
-        },
+    builder.task(
+        TaskDefinition::interval(SD_WATCHDOG_TASK, period)
+            .category(TaskCategory::EngineSystem)
+            .ephemeral()
+            .run(|_ctx: TaskContext| async {
+                crate::notify::notify_watchdog();
+                TaskOutcome::Done
+            }),
     )
 }
 

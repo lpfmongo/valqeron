@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use valqeron_core::{
-    RepositoryResult, RunOutcome, TaskDeclaration, TaskKind, TaskRegistration,
-    TaskRegistrationRepository,
+    RepositoryResult, TaskDeclaration, TaskKind, TaskRegistration, TaskRegistrationRepository,
 };
 
 use crate::sqlite::database::{Db, DbHandle};
@@ -84,20 +83,6 @@ impl TaskRegistrationRepository for SqliteTaskRegistrationRepository {
         })
         .map_err(backend)
     }
-
-    fn record_run(
-        &self,
-        kind: &TaskKind,
-        outcome: RunOutcome,
-        error: Option<String>,
-        at: DateTime<Utc>,
-    ) -> RepositoryResult<()> {
-        with_busy_retry(|| {
-            let conn = self.db.write();
-            queries::record_run(&conn, kind, outcome, error.as_deref(), at).map(|_| ())
-        })
-        .map_err(backend)
-    }
 }
 
 #[cfg(test)]
@@ -105,7 +90,7 @@ mod tests {
     use super::*;
     use crate::sqlite::database::{Database, TempDatabase};
     use chrono::TimeZone;
-    use valqeron_core::{LogPolicy, SyncSource, TaskCategory, TaskTier, TaskTracking};
+    use valqeron_core::{LogPolicy, SyncSource, TaskCategory, TaskTracking, TaskTrigger};
 
     fn test_repo() -> (TempDatabase, SqliteTaskRegistrationRepository) {
         let db = Database::open_temp();
@@ -125,7 +110,7 @@ mod tests {
         TaskDeclaration {
             kind: kind(name),
             category: TaskCategory::FinanceDataSync,
-            tier: TaskTier::Sync,
+            trigger: TaskTrigger::Sync,
             tracking: TaskTracking::Durable,
             schedule: "sync:daily@07:00-03:00".into(),
             source: Some(SyncSource::new("cvm").unwrap()),
@@ -142,7 +127,7 @@ mod tests {
         let found = repo.get(&kind("cvm_daily_sync")).unwrap().expect("row");
         assert_eq!(found.kind().as_str(), "cvm_daily_sync");
         assert_eq!(found.category(), TaskCategory::FinanceDataSync);
-        assert_eq!(found.tier(), TaskTier::Sync);
+        assert_eq!(found.trigger(), TaskTrigger::Sync);
         assert_eq!(found.tracking(), TaskTracking::Durable);
         assert_eq!(found.schedule(), "sync:daily@07:00-03:00");
         assert_eq!(found.source().map(|s| s.as_str()), Some("cvm"));
@@ -150,18 +135,15 @@ mod tests {
         assert!(found.config_enabled());
         assert!(!found.paused());
         assert!(found.registered());
-        assert_eq!(found.total_runs(), 0);
         assert_eq!(found.first_registered_at(), now());
     }
 
     #[test]
-    fn redeclare_preserves_paused_and_run_summary() {
+    fn redeclare_preserves_paused_intent() {
         let (_db, repo) = test_repo();
         let k = kind("cvm_daily_sync");
         repo.declare(&declaration("cvm_daily_sync"), now()).unwrap();
         repo.set_paused(&k, true, now()).unwrap();
-        repo.record_run(&k, RunOutcome::Failed, Some("boom".into()), now())
-            .unwrap();
 
         // Next boot re-declares with a changed schedule + disabled config.
         let mut redeclared = declaration("cvm_daily_sync");
@@ -178,9 +160,6 @@ mod tests {
         );
         assert!(!found.config_enabled(), "declaration updated");
         assert!(found.paused(), "operator intent preserved");
-        assert_eq!(found.total_runs(), 1, "run summary preserved");
-        assert_eq!(found.total_failures(), 1);
-        assert_eq!(found.last_error(), Some("boom"));
         assert_eq!(
             found.first_registered_at(),
             now(),
@@ -220,27 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn record_run_accumulates_totals_and_last_state() {
-        let (_db, repo) = test_repo();
-        let k = kind("t");
-        repo.declare(&declaration("t"), now()).unwrap();
-
-        repo.record_run(&k, RunOutcome::Succeeded, None, now())
-            .unwrap();
-        repo.record_run(&k, RunOutcome::Failed, Some("x".into()), now())
-            .unwrap();
-        repo.record_run(&k, RunOutcome::Succeeded, None, now())
-            .unwrap();
-
-        let found = repo.get(&k).unwrap().expect("row");
-        assert_eq!(found.total_runs(), 3);
-        assert_eq!(found.total_failures(), 1);
-        assert_eq!(found.last_outcome(), Some(RunOutcome::Succeeded));
-        // last_error reflects the last run (a success clears it).
-        assert_eq!(found.last_error(), None);
-    }
-
-    #[test]
     fn is_paused_and_set_paused_semantics() {
         let (_db, repo) = test_repo();
         let k = kind("t");
@@ -259,7 +217,7 @@ mod tests {
         let (_db, repo) = test_repo();
         let mut sys = declaration("z_system");
         sys.category = TaskCategory::EngineSystem;
-        sys.tier = TaskTier::Interval;
+        sys.trigger = TaskTrigger::Interval;
         sys.source = None;
         repo.declare(&sys, now()).unwrap();
         repo.declare(&declaration("a_sync"), now()).unwrap();

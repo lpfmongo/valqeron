@@ -1,4 +1,4 @@
-//! The sync plane: cursor-driven recurrence with sequential catch-up.
+//! The sync trigger: cursor-driven recurrence with sequential catch-up.
 //!
 //! Each sync source owns a durable [`SyncCursor`] row. The seeding pass
 //! keeps **at most one** `background_task` row alive per source —
@@ -8,7 +8,7 @@
 //! waits: catch-up after an outage and steady state are the same code path,
 //! one slot at a time, in chronological order.
 //!
-//! The cursor is owned by the plane, not by handlers: it advances on
+//! The cursor is owned by the trigger, not by handlers: it advances on
 //! [`TaskOutcome::Done`], holds with a cooldown on
 //! [`TaskOutcome::NotReady`], and holds with an escalating failure cooldown
 //! when a run fails terminally. The consequence is at-least-once execution —
@@ -26,16 +26,16 @@ use valqeron_core::{
 use valqeron_infrastructure::SqliteStorageEngine;
 
 use crate::storage::AsyncStorage;
-use crate::tasks::plane::{
-    BoxFuture, Plane, RECONCILE_INTERVAL, RetryPolicy, RunWindow, SeedPass, TaskFailure,
-    TaskOutcome, TickMode,
+use crate::tasks::trigger::{
+    BoxFuture, Interpretation, RECONCILE_INTERVAL, RetryPolicy, RunWindow, SeedPass, TaskFailure,
+    TaskOutcome, TickMode, Trigger,
 };
 
 /// Consecutive terminal failures after which the halt log escalates from
 /// `warn` to `error` — also the status read model's `halted` threshold.
 pub(crate) const ESCALATE_AFTER_FAILURES: u32 = 5;
 
-pub(crate) struct SyncPlane {
+pub(crate) struct SyncTrigger {
     kind: &'static str,
     source: SyncSource,
     schedule: Schedule,
@@ -47,7 +47,7 @@ pub(crate) struct SyncPlane {
     wake: Notify,
 }
 
-impl SyncPlane {
+impl SyncTrigger {
     pub(crate) fn new(
         kind: &'static str,
         source: SyncSource,
@@ -90,7 +90,7 @@ fn fault(message: String) -> StorageError {
     StorageError::Fault(StorageFault::new(message))
 }
 
-impl Plane for SyncPlane {
+impl Trigger for SyncTrigger {
     fn cadence(&self) -> (tokio::time::Instant, Duration) {
         // First pass immediately: a catch-up must not wait for the tick.
         (tokio::time::Instant::now(), RECONCILE_INTERVAL)
@@ -234,13 +234,13 @@ impl Plane for SyncPlane {
     /// — re-running a synced period is safe (handlers are idempotent),
     /// silently losing the advance is not. `Failed` is handed back to the
     /// dispatcher so task-level retries apply; the cursor is only touched
-    /// on *terminal* failure, in [`Plane::on_terminal`].
+    /// on *terminal* failure, in [`Trigger::on_terminal`].
     fn interpret<'a>(
         &'a self,
         storage: &'a AsyncStorage,
         window: RunWindow,
         outcome: TaskOutcome,
-    ) -> BoxFuture<'a, Result<(), TaskFailure>> {
+    ) -> BoxFuture<'a, Result<Interpretation, TaskFailure>> {
         Box::pin(async move {
             let RunWindow::Period { slot, target } = window else {
                 return Err(TaskFailure::new("sync run without a period window"));
@@ -262,7 +262,7 @@ impl Plane for SyncPlane {
                         })
                         .await;
                     match advanced {
-                        Ok(Ok(())) => Ok(()),
+                        Ok(Ok(())) => Ok(Interpretation::Completed),
                         Ok(Err(e)) => Err(TaskFailure::new(format!("cursor advance failed: {e}"))),
                         Err(e) => Err(TaskFailure::new(format!(
                             "cursor advance not executed: {e}"
@@ -295,7 +295,7 @@ impl Plane for SyncPlane {
                                 retry_after_secs,
                                 "source has not published the target period yet; holding"
                             );
-                            Ok(())
+                            Ok(Interpretation::NotReady)
                         }
                         Ok(Err(e)) => Err(TaskFailure::new(format!("cursor hold failed: {e}"))),
                         Err(e) => Err(TaskFailure::new(format!("cursor hold not executed: {e}"))),
@@ -452,13 +452,13 @@ mod tests {
 #[cfg(test)]
 mod manager_tests {
     use super::*;
-    use crate::tasks::plane::PlaneConfig;
-    use crate::tasks::{BackgroundTasksManager, TaskSpec};
+    use crate::tasks::{BackgroundTasks, SyncTaskBuilder, TaskContext, TaskDefinition};
     use chrono::NaiveTime;
     use std::sync::{Arc, Mutex};
     use valqeron_core::{
-        LogPolicy, MarketCalendar, Recurrence, SyncOutcomeKind, TaskCategory,
-        TaskRegistrationRepository, TaskStatus, TaskTracking, Versioned,
+        ExecutionOutcome, LogPolicy, MarketCalendar, Recurrence, SyncOutcomeKind, TaskCategory,
+        TaskExecution, TaskExecutionRepository, TaskRegistrationRepository, TaskStatus,
+        TaskTracking, Versioned,
     };
     use valqeron_infrastructure::DatabaseConfig;
 
@@ -497,19 +497,12 @@ mod manager_tests {
         SyncSource::new(name).unwrap()
     }
 
-    fn spec(name: &str, kind: &'static str, cooldown_secs: u32) -> TaskSpec {
-        TaskSpec {
-            kind,
-            category: TaskCategory::FinanceDataSync,
-            plane: PlaneConfig::Sync {
-                source: source(name),
-                schedule: daily_b3(),
-                retry: RetryPolicy::none(),
-                cooldown: CooldownPolicy::new(cooldown_secs),
-                max_backfill_days: 90,
-            },
-            log_policy: LogPolicy::All,
-        }
+    /// A sync task on the shared test schedule, single-attempt so a failed
+    /// run is terminal (the tests exercise cursor semantics, not retries).
+    fn sync_task(name: &str, kind: &'static str, cooldown_secs: u32) -> SyncTaskBuilder {
+        TaskDefinition::sync(kind, source(name), daily_b3())
+            .retry(RetryPolicy::none())
+            .cooldown_secs(cooldown_secs)
     }
 
     /// The occurrence `steps` back from the latest one before `now`.
@@ -552,12 +545,20 @@ mod manager_tests {
             .expect("get cursor")
     }
 
-    async fn all_rows(storage: &AsyncStorage) -> Vec<Versioned<BackgroundTask>> {
+    async fn queued_rows(storage: &AsyncStorage) -> Vec<Versioned<BackgroundTask>> {
         storage
-            .read("test.rows", |repos| repos.tasks.list_recent(100))
+            .read("test.rows", |repos| repos.tasks.list_queued(100))
             .await
             .expect("no backpressure")
             .expect("list rows")
+    }
+
+    async fn executions(storage: &AsyncStorage) -> Vec<TaskExecution> {
+        storage
+            .read("test.executions", |repos| repos.executions.list_recent(100))
+            .await
+            .expect("no backpressure")
+            .expect("list executions")
     }
 
     type Recorded = Arc<Mutex<Vec<(DateTime<Utc>, TargetPeriod)>>>;
@@ -567,13 +568,13 @@ mod manager_tests {
     ) -> (
         Recorded,
         impl Fn(
-            crate::tasks::plane::TaskContext,
+            crate::tasks::trigger::TaskContext,
         ) -> std::pin::Pin<Box<dyn Future<Output = TaskOutcome> + Send>>
         + Clone,
     ) {
         let runs: Recorded = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&runs);
-        let handler = move |ctx: crate::tasks::plane::TaskContext| -> std::pin::Pin<Box<dyn Future<Output = TaskOutcome> + Send>> {
+        let handler = move |ctx: crate::tasks::trigger::TaskContext| -> std::pin::Pin<Box<dyn Future<Output = TaskOutcome> + Send>> {
             let sink = Arc::clone(&sink);
             let outcome = outcome.clone();
             Box::pin(async move {
@@ -600,8 +601,8 @@ mod manager_tests {
         seed_cursor(&storage, "cvm", &schedule, seed_slot).await;
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("cvm", "test_cvm_sync", 300), handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
 
@@ -649,7 +650,7 @@ mod manager_tests {
         assert_eq!(cursor.consecutive_failures(), 0);
 
         // And the next occurrence is already seeded, in the future.
-        let rows = all_rows(&storage).await;
+        let rows = queued_rows(&storage).await;
         let pending: Vec<_> = rows
             .iter()
             .filter(|t| t.data.status() == TaskStatus::Pending)
@@ -659,9 +660,10 @@ mod manager_tests {
             pending.iter().all(|t| t.data.scheduled_at() > now),
             "the seeded row waits for a future slot"
         );
-        let succeeded = rows
+        let succeeded = executions(&storage)
+            .await
             .iter()
-            .filter(|t| t.data.status() == TaskStatus::Succeeded)
+            .filter(|e| e.outcome == ExecutionOutcome::Succeeded)
             .count();
         assert_eq!(succeeded, 10);
     }
@@ -678,8 +680,8 @@ mod manager_tests {
         let (runs, handler) = recording_handler(TaskOutcome::NotReady {
             retry_after_secs: 3600,
         });
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("cvm", "test_cvm_sync", 300), handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
 
@@ -700,12 +702,16 @@ mod manager_tests {
         assert_eq!(cursor.last_outcome(), Some(SyncOutcomeKind::NotReady));
         assert!(cursor.cooldown_until().is_some());
 
-        let rows = all_rows(&storage).await;
-        assert_eq!(rows.len(), 1, "one task row total: {rows:?}");
+        assert!(
+            queued_rows(&storage).await.is_empty(),
+            "cooldown: nothing further seeded"
+        );
+        let history = executions(&storage).await;
+        assert_eq!(history.len(), 1, "one recorded run: {history:?}");
         assert_eq!(
-            rows[0].data.status(),
-            TaskStatus::Succeeded,
-            "not-ready is not an error"
+            history[0].outcome,
+            ExecutionOutcome::NotReady,
+            "waited is not worked — and not an error either"
         );
     }
 
@@ -720,8 +726,8 @@ mod manager_tests {
         let (runs, handler) = recording_handler(TaskOutcome::Failed("cvm exploded".into()));
         // Cooldown base 3600s: after the first terminal failure nothing
         // more may be seeded within this test's lifetime.
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("cvm", "test_cvm_sync", 3600), handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 3600).run(handler))
             .start(storage.clone())
             .await;
 
@@ -742,10 +748,14 @@ mod manager_tests {
         assert_eq!(cursor.last_error(), Some("cvm exploded"));
         assert!(cursor.cooldown_until().is_some_and(|u| u > Utc::now()));
 
-        let rows = all_rows(&storage).await;
-        assert_eq!(rows.len(), 1, "halted: no further seeds: {rows:?}");
-        assert_eq!(rows[0].data.status(), TaskStatus::Failed);
-        assert_eq!(rows[0].data.scheduled_at(), first_missed);
+        assert!(
+            queued_rows(&storage).await.is_empty(),
+            "halted: no further seeds"
+        );
+        let history = executions(&storage).await;
+        assert_eq!(history.len(), 1, "one recorded run: {history:?}");
+        assert_eq!(history[0].outcome, ExecutionOutcome::Failed);
+        assert_eq!(history[0].scheduled_at, first_missed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -757,8 +767,8 @@ mod manager_tests {
         seed_cursor(&storage, "cvm", &schedule, seed_slot).await;
 
         let (runs, handler) = recording_handler(TaskOutcome::Failed("still broken".into()));
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("cvm", "test_cvm_sync", 0), handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 0).run(handler))
             .start(storage.clone())
             .await;
 
@@ -793,8 +803,8 @@ mod manager_tests {
         let latest = occurrence_back(&schedule, now, 0);
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("cvm", "test_cvm_sync", 300), handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
 
@@ -829,15 +839,12 @@ mod manager_tests {
         seed_cursor(&storage, "cvm", &schedule, seed_slot).await;
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let mut clamped = spec("cvm", "test_cvm_sync", 300);
-        if let PlaneConfig::Sync {
-            max_backfill_days, ..
-        } = &mut clamped.plane
-        {
-            *max_backfill_days = 3; // 10 pending days > 3 → skip ahead.
-        }
-        let manager = BackgroundTasksManager::builder()
-            .register(clamped, handler)
+        let manager = BackgroundTasks::builder()
+            .task(
+                sync_task("cvm", "test_cvm_sync", 300)
+                    .max_backfill_days(3) // 10 pending days > 3 → skip ahead.
+                    .run(handler),
+            )
             .start(storage.clone())
             .await;
 
@@ -869,9 +876,9 @@ mod manager_tests {
 
         let (a_runs, a_handler) = recording_handler(TaskOutcome::Done);
         let (b_runs, b_handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("alpha", "test_alpha_sync", 300), a_handler)
-            .register(spec("beta", "test_beta_sync", 300), b_handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("alpha", "test_alpha_sync", 300).run(a_handler))
+            .task(sync_task("beta", "test_beta_sync", 300).run(b_handler))
             .start(storage.clone())
             .await;
 
@@ -888,17 +895,26 @@ mod manager_tests {
         assert_eq!(a_runs.lock().expect("lock").len(), 3, "alpha caught up");
         assert_eq!(b_runs.lock().expect("lock").len(), 1, "beta cold-started");
 
-        let rows = all_rows(&storage).await;
-        let alpha_rows = rows
+        let history = executions(&storage).await;
+        let queued = queued_rows(&storage).await;
+        let alpha_done = history
+            .iter()
+            .filter(|e| e.kind.as_str() == "test_alpha_sync")
+            .count();
+        let beta_done = history
+            .iter()
+            .filter(|e| e.kind.as_str() == "test_beta_sync")
+            .count();
+        let alpha_queued = queued
             .iter()
             .filter(|t| t.data.kind().as_str() == "test_alpha_sync")
             .count();
-        let beta_rows = rows
+        let beta_queued = queued
             .iter()
             .filter(|t| t.data.kind().as_str() == "test_beta_sync")
             .count();
-        assert_eq!(alpha_rows, 4, "3 succeeded + 1 future");
-        assert_eq!(beta_rows, 2, "1 succeeded + 1 future");
+        assert_eq!((alpha_done, alpha_queued), (3, 1), "3 succeeded + 1 future");
+        assert_eq!((beta_done, beta_queued), (1, 1), "1 succeeded + 1 future");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -906,21 +922,14 @@ mod manager_tests {
         let (_dir, storage) = storage();
         let (runs, handler) = recording_handler(TaskOutcome::Done);
 
-        let manager = BackgroundTasksManager::builder()
-            .register(
-                TaskSpec {
-                    kind: "test_dup_kind",
-                    category: TaskCategory::EngineSystem,
-                    plane: PlaneConfig::Interval {
-                        period: Duration::from_secs(600),
-                        jitter: false,
-                        tracking: crate::tasks::plane::Tracking::Durable,
-                    },
-                    log_policy: LogPolicy::All,
-                },
-                |_ctx| async { TaskOutcome::Done },
+        let manager = BackgroundTasks::builder()
+            .task(
+                TaskDefinition::interval("test_dup_kind", Duration::from_secs(600))
+                    .category(TaskCategory::EngineSystem)
+                    .no_jitter()
+                    .run(|_ctx: TaskContext| async { TaskOutcome::Done }),
             )
-            .register(spec("cvm", "test_dup_kind", 300), handler)
+            .task(sync_task("cvm", "test_dup_kind", 300).run(handler))
             .start(storage.clone())
             .await;
 
@@ -932,7 +941,7 @@ mod manager_tests {
             get_cursor(&storage, "cvm").await.is_none(),
             "no sync seeder, no cursor"
         );
-        assert!(all_rows(&storage).await.is_empty(), "nothing seeded");
+        assert!(queued_rows(&storage).await.is_empty(), "nothing seeded");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -952,7 +961,7 @@ mod manager_tests {
                 let declaration = valqeron_core::TaskDeclaration {
                     kind: TaskKind::new("test_cvm_sync").unwrap(),
                     category: TaskCategory::FinanceDataSync,
-                    tier: valqeron_core::TaskTier::Sync,
+                    trigger: valqeron_core::TaskTrigger::Sync,
                     tracking: TaskTracking::Durable,
                     schedule: "sync:daily@07:00-03:00".into(),
                     source: Some(SyncSource::new("cvm").unwrap()),
@@ -969,15 +978,15 @@ mod manager_tests {
             .unwrap();
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("cvm", "test_cvm_sync", 300), handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
 
         // Paused across boot: the stale cursor must NOT trigger catch-up.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(runs.lock().expect("lock").is_empty(), "paused: no runs");
-        assert!(all_rows(&storage).await.is_empty(), "paused: no seeds");
+        assert!(queued_rows(&storage).await.is_empty(), "paused: no seeds");
 
         // Unpause and kick the seeder (production waits for the 60s tick).
         storage
@@ -1059,8 +1068,8 @@ mod manager_tests {
             .expect("seed running row");
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasksManager::builder()
-            .register(spec("cvm", "test_cvm_sync", 300), handler)
+        let manager = BackgroundTasks::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
 
@@ -1068,10 +1077,10 @@ mod manager_tests {
         wait_until(10, async || !probe.lock().expect("lock").is_empty()).await;
         let probe_storage = storage.clone();
         wait_until(10, async || {
-            all_rows(&probe_storage)
+            executions(&probe_storage)
                 .await
                 .iter()
-                .any(|t| t.data.status() == TaskStatus::Succeeded)
+                .any(|e| e.outcome == ExecutionOutcome::Succeeded)
         })
         .await;
         assert!(manager.drain(Duration::from_secs(3)).await);

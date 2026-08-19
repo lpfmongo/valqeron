@@ -1,35 +1,34 @@
-//! Cached statements for the `task_registration` table.
+//! Cached statements for the `task_registry` table.
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use valqeron_core::{RunOutcome, TaskDeclaration, TaskKind};
+use valqeron_core::{TaskDeclaration, TaskKind};
 
 use crate::sqlite::row::{FromRow, canonical_timestamp};
 use crate::sqlite::task_registration::mapping::{
-    category_as_str, log_policy_as_str, run_outcome_as_str, tier_as_str, tracking_as_str,
+    category_as_str, log_policy_as_str, tracking_as_str, trigger_as_str,
 };
 use crate::sqlite::task_registration::model::RegistrationRow;
 
-const REGISTRATION_COLUMNS: &str = "kind, category, tier, tracking, schedule, source, \
+const REGISTRATION_COLUMNS: &str = "kind, category, trigger_kind, tracking, schedule, source, \
                                     log_policy, config_enabled, paused, registered, \
-                                    last_run_at, last_outcome, last_error, total_runs, \
-                                    total_failures, first_registered_at, updated_at";
+                                    first_registered_at, updated_at";
 
 /// Upsert from a code declaration. On conflict only the declaration columns
-/// are rewritten — operator intent (`paused`) and the run summary survive.
+/// are rewritten — operator intent (`paused`) survives.
 pub(crate) fn declare(
     conn: &Connection,
     declaration: &TaskDeclaration,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO task_registration (kind, category, tier, tracking, schedule, source, \
+        "INSERT INTO task_registry (kind, category, trigger_kind, tracking, schedule, source, \
                                         log_policy, config_enabled, first_registered_at, \
                                         updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
          ON CONFLICT(kind) DO UPDATE SET
             category       = excluded.category,
-            tier           = excluded.tier,
+            trigger_kind   = excluded.trigger_kind,
             tracking       = excluded.tracking,
             schedule       = excluded.schedule,
             source         = excluded.source,
@@ -41,7 +40,7 @@ pub(crate) fn declare(
     stmt.execute(params![
         declaration.kind.as_str(),
         category_as_str(declaration.category),
-        tier_as_str(declaration.tier),
+        trigger_as_str(declaration.trigger),
         tracking_as_str(declaration.tracking),
         declaration.schedule,
         declaration.source.as_ref().map(|s| s.as_str()),
@@ -60,10 +59,10 @@ pub(crate) fn registered_kinds_not_in(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = if kinds.is_empty() {
-        "SELECT kind FROM task_registration WHERE registered = 1".to_owned()
+        "SELECT kind FROM task_registry WHERE registered = 1".to_owned()
     } else {
         format!(
-            "SELECT kind FROM task_registration WHERE registered = 1 AND kind NOT IN ({placeholders})"
+            "SELECT kind FROM task_registry WHERE registered = 1 AND kind NOT IN ({placeholders})"
         )
     };
     let mut stmt = conn.prepare(&sql)?;
@@ -74,27 +73,26 @@ pub(crate) fn registered_kinds_not_in(
 
 pub(crate) fn retire(conn: &Connection, kind: &str, now: DateTime<Utc>) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "UPDATE task_registration SET registered = 0, updated_at = ?2 WHERE kind = ?1",
+        "UPDATE task_registry SET registered = 0, updated_at = ?2 WHERE kind = ?1",
     )?;
     stmt.execute(params![kind, canonical_timestamp(now)])
 }
 
 pub(crate) fn get(conn: &Connection, kind: &TaskKind) -> rusqlite::Result<Option<RegistrationRow>> {
-    let sql = format!("SELECT {REGISTRATION_COLUMNS} FROM task_registration WHERE kind = ?1");
+    let sql = format!("SELECT {REGISTRATION_COLUMNS} FROM task_registry WHERE kind = ?1");
     let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_row(params![kind.as_str()], RegistrationRow::from_row)
         .optional()
 }
 
 pub(crate) fn list(conn: &Connection) -> rusqlite::Result<Vec<RegistrationRow>> {
-    let sql =
-        format!("SELECT {REGISTRATION_COLUMNS} FROM task_registration ORDER BY category, kind");
+    let sql = format!("SELECT {REGISTRATION_COLUMNS} FROM task_registry ORDER BY category, kind");
     let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_map([], RegistrationRow::from_row)?.collect()
 }
 
 pub(crate) fn is_paused(conn: &Connection, kind: &TaskKind) -> rusqlite::Result<Option<bool>> {
-    let mut stmt = conn.prepare_cached("SELECT paused FROM task_registration WHERE kind = ?1")?;
+    let mut stmt = conn.prepare_cached("SELECT paused FROM task_registry WHERE kind = ?1")?;
     stmt.query_row(params![kind.as_str()], |row| row.get(0))
         .optional()
 }
@@ -105,35 +103,7 @@ pub(crate) fn set_paused(
     paused: bool,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare_cached(
-        "UPDATE task_registration SET paused = ?2, updated_at = ?3 WHERE kind = ?1",
-    )?;
+    let mut stmt = conn
+        .prepare_cached("UPDATE task_registry SET paused = ?2, updated_at = ?3 WHERE kind = ?1")?;
     stmt.execute(params![kind.as_str(), paused, canonical_timestamp(now)])
-}
-
-pub(crate) fn record_run(
-    conn: &Connection,
-    kind: &TaskKind,
-    outcome: RunOutcome,
-    error: Option<&str>,
-    at: DateTime<Utc>,
-) -> rusqlite::Result<usize> {
-    let failed = matches!(outcome, RunOutcome::Failed);
-    let mut stmt = conn.prepare_cached(
-        "UPDATE task_registration SET
-            last_run_at    = ?2,
-            last_outcome   = ?3,
-            last_error     = ?4,
-            total_runs     = total_runs + 1,
-            total_failures = total_failures + ?5,
-            updated_at     = ?2
-         WHERE kind = ?1",
-    )?;
-    stmt.execute(params![
-        kind.as_str(),
-        canonical_timestamp(at),
-        run_outcome_as_str(outcome),
-        error,
-        i64::from(failed),
-    ])
 }

@@ -1,27 +1,28 @@
 # Overview
 
-Valqeron Engine run recurring background tasks, like database maintenance, liveness pings, operational data pruning,
-market-data ingestion jobs, and other.
+The engine runs recurring background work — database maintenance, liveness pings, run-history pruning, market-data
+ingestion — through one small framework behind one door: `crate::tasks`. Register a `TaskDefinition` (a typed builder
+per *trigger*), hand it a handler, and everything else comes for free.
 
-## What the framework provides
+| Concern              | Mechanism                                                       |
+|----------------------|-----------------------------------------------------------------|
+| **Registration**     | `BackgroundTasks::builder().task(TaskDefinition::…)`            |
+| **Scheduling**       | Three *triggers* — interval, recurring, sync                    |
+| **Durability**       | Live work is a row in `task_queue`; the row *is* the alarm      |
+| **Retries**          | Per-run attempt budget with capped exponential backoff          |
+| **History**          | Terminal runs move to `task_execution` (pruned after 7 days)    |
+| **Stats**            | Prune-proof per-kind aggregates in `task_stat` — never deleted  |
+| **Crash recovery**   | `RUNNING` rows at boot are requeued or recorded as failed       |
+| **Catalog**          | Every registered kind persisted in `task_registry`              |
+| **Status**           | Derived on read from catalog ⋈ queue ⋈ stats ⋈ cursors          |
+| **Operator control** | `paused` flag (persisted) + per-task worker stop/start (runtime)|
+| **Observability**    | Per-run spans, category-tagged audit events, log policy         |
+| **Data sync**        | Cursors, sequential catch-up, cooldowns, halt-on-failure        |
 
-| Concern              | Mechanism                                                     |
-|----------------------|---------------------------------------------------------------|
-| **Registration**     | One call: `register(TaskSpec, handler)`                       |
-| **Scheduling**       | Three *execution planes* — interval, recurring, sync          |
-| **Durability**       | Runs are rows in `background_task`; the row *is* the alarm    |
-| **Retries**          | Per-run attempt budget with capped exponential backoff        |
-| **Crash recovery**   | `RUNNING` rows at boot are requeued or failed                 |
-| **Catalog**          | Every registered kind persisted in `task_registration`        |
-| **Status**           | Derived on read from catalog ⋈ queue ⋈ cursors — never stored |
-| **Operator control** | `paused` flag, honoured within 60s, no restart                |
-| **Observability**    | Per-run spans, category-tagged audit events, log policy       |
-| **Data sync**        | Cursors, sequential catch-up, cooldowns, halt-on-failure      |
+## The three triggers at a glance
 
-## The three planes at a glance
-
-A task picks exactly one plane. The plane decides *when* the task runs and what its state means; the task itself only
-supplies a handler.
+A task picks exactly one trigger. The trigger decides *when* the task runs and what its state means; the task itself
+only supplies a handler.
 
 ```mermaid
 flowchart LR
@@ -75,23 +76,21 @@ filtering, and defaults.
 
 ## The two guarantees worth internalising
 
-**1. The durable row is the alarm.** For the recurring and sync planes the next occurrence exists as a `PENDING` row
-with `scheduled_at` in the future, *before*
-that time arrives. Nothing is held in process memory, so a restart, a laptop suspend, or a crash cannot lose a scheduled
-run — the row simply becomes past-due and runs at the next boot.
-
-This is not theoretical. A monotonic 24-hour ticker on a user-scoped daemon that restarts at every logout **never
-fires**. That was a real bug in
-`task_prune`, fixed by moving it to the recurring plane.
+**1. The durable row is the alarm.** For the recurring and sync triggers the next occurrence exists as a `PENDING` row
+with a future `scheduled_at` *before* that time arrives. Nothing lives in process memory, so a restart, suspend, or
+crash cannot lose a scheduled run — the row becomes past-due and runs at the next boot. (A monotonic 24-hour ticker on
+a daemon that restarts at every logout **never fires**; that real `task_prune` bug is why the recurring trigger
+exists.)
 
 **2. Sync progress is a cursor, not a log.** A sync source records how far it has got in `sync_cursor`, independent of
-the run history — which
-`task_prune` deletes after seven days. Catch-up after a ten-day outage works because the cursor survived, and it
-proceeds *one period at a time, in chronological order*, because exactly one row per source is ever in flight.
+the run history that `task_prune` deletes after seven days. Catch-up after a ten-day outage works because the cursor
+survived — one period at a time, in chronological order, because exactly one row per source is ever in flight. The same
+prune-proofness holds for the per-kind aggregates in `task_stat`.
 
 ## Where to go next
 
-- [Architecture](./architecture.md) — the layer boundaries and why they exist
+- [Architecture](./architecture.md) — the façade, the data model, and the life of a run
+- [Triggers](./triggers.md) — interval, recurring, and sync in depth
 - [Adding a Task](./adding-a-task.md) — the practical walkthrough
-- [Scenarios](./scenarios.md) — outage, pause, halt, retire, worked end to end
-- [Reference](./reference.md) — constants, env vars, schemas
+- [Operations](./operations.md) — config, status, pause, troubleshooting, scenarios
+- [Reference](./reference.md) — constants, schemas, invariants

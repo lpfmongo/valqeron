@@ -6,9 +6,7 @@ mod listing;
 mod schedule;
 mod security;
 mod storage;
-mod sync;
-mod task;
-mod task_registration;
+mod tasks;
 mod venue;
 
 pub use common::{LoadMode, Loading, RepositoryResult, Versioned, WriteOutcome};
@@ -91,32 +89,25 @@ pub use listing::{
     },
 };
 
-pub use task::repository::BackgroundTaskRepository;
-
-pub use task::{
-    BackgroundTask, BackgroundTaskBuilder, BackgroundTaskSnapshot, TaskCompletion, TaskId,
-    TaskKind, TaskStatus,
-    error::{TaskBuilderError, TaskKindError, TaskStatusError},
-};
-
 pub use calendar::MarketCalendar;
 
 pub use schedule::{Recurrence, Schedule, TargetPeriod};
 
-pub use sync::repository::SyncCursorRepository;
-
-pub use sync::{
-    SyncCursor, SyncCursorSnapshot, SyncOutcome, SyncOutcomeKind, SyncSource,
-    cooldown::CooldownPolicy,
-    error::{SyncOutcomeKindError, SyncSourceError},
+pub use tasks::repository::{
+    BackgroundTaskRepository, SyncCursorRepository, TaskExecutionRepository,
+    TaskRegistrationRepository, TaskStatRepository,
 };
 
-pub use task_registration::repository::TaskRegistrationRepository;
-
-pub use task_registration::service::{TaskStatusEntry, list_task_statuses};
-
-pub use task_registration::{
-    DerivedTaskStatus, LogPolicy, RunOutcome, TaskCategory, TaskDeclaration, TaskRegistration,
-    TaskRegistrationSnapshot, TaskTier, TaskTracking, derive_status,
-    error::{LogPolicyError, RunOutcomeError, TaskCategoryError, TaskTierError, TaskTrackingError},
+pub use tasks::{
+    BackgroundTask, BackgroundTaskBuilder, BackgroundTaskSnapshot, CooldownPolicy,
+    DerivedTaskStatus, ExecutionOutcome, LogPolicy, SyncCursor, SyncCursorSnapshot, SyncOutcome,
+    SyncOutcomeKind, SyncSource, TaskCategory, TaskCompletion, TaskDeclaration, TaskExecution,
+    TaskId, TaskKind, TaskRegistration, TaskRegistrationSnapshot, TaskStats, TaskStatus,
+    TaskStatusEntry, TaskTracking, TaskTrigger, derive_status,
+    error::{
+        ExecutionOutcomeError, LogPolicyError, SyncOutcomeKindError, SyncSourceError,
+        TaskBuilderError, TaskCategoryError, TaskKindError, TaskStatusError, TaskTrackingError,
+        TaskTriggerError,
+    },
+    list_task_statuses,
 };

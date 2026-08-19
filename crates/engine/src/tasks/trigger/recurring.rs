@@ -1,4 +1,4 @@
-//! The recurring plane: wall-clock business-day occurrences, always
+//! The recurring trigger: wall-clock business-day occurrences, always
 //! durable. The next occurrence is seeded ahead as a future `PENDING` row —
 //! the row itself is the alarm, so it survives restarts and suspend, and a
 //! slot the engine was down for runs once at the next boot (unlike an
@@ -16,12 +16,12 @@ use valqeron_core::{
 use valqeron_infrastructure::SqliteStorageEngine;
 
 use crate::storage::AsyncStorage;
-use crate::tasks::plane::{
-    BoxFuture, Plane, RECONCILE_INTERVAL, RetryPolicy, RunWindow, SeedPass, TaskFailure,
-    TaskOutcome, TickMode,
+use crate::tasks::trigger::{
+    BoxFuture, Interpretation, RECONCILE_INTERVAL, RetryPolicy, RunWindow, SeedPass, TaskFailure,
+    TaskOutcome, TickMode, Trigger,
 };
 
-pub(crate) struct RecurringPlane {
+pub(crate) struct RecurringTrigger {
     kind: &'static str,
     schedule: Schedule,
     retry: RetryPolicy,
@@ -30,7 +30,7 @@ pub(crate) struct RecurringPlane {
     wake: Notify,
 }
 
-impl RecurringPlane {
+impl RecurringTrigger {
     pub(crate) fn new(kind: &'static str, schedule: Schedule, retry: RetryPolicy) -> Self {
         Self {
             kind,
@@ -41,7 +41,7 @@ impl RecurringPlane {
     }
 }
 
-impl Plane for RecurringPlane {
+impl Trigger for RecurringTrigger {
     fn cadence(&self) -> (tokio::time::Instant, Duration) {
         // First pass immediately: reseeding after a restart must not wait.
         (tokio::time::Instant::now(), RECONCILE_INTERVAL)
@@ -100,17 +100,17 @@ impl Plane for RecurringPlane {
         _storage: &'a AsyncStorage,
         _window: RunWindow,
         outcome: TaskOutcome,
-    ) -> BoxFuture<'a, Result<(), TaskFailure>> {
+    ) -> BoxFuture<'a, Result<Interpretation, TaskFailure>> {
         Box::pin(async move {
             match outcome {
-                TaskOutcome::Done => Ok(()),
+                TaskOutcome::Done => Ok(Interpretation::Completed),
                 TaskOutcome::NotReady { retry_after_secs } => {
                     tracing::info!(
                         kind = self.kind,
                         retry_after_secs,
                         "run reported not-ready; the next occurrence retries"
                     );
-                    Ok(())
+                    Ok(Interpretation::NotReady)
                 }
                 TaskOutcome::Failed(error) => Err(TaskFailure::new(error)),
             }

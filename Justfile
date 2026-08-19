@@ -82,12 +82,26 @@ engine-install:
             exit 1
         fi
     }
+    # A wrong-but-plausible binary path passes the CHANGE-ME check and syntax
+    # lint, then launchd/systemd tears down the running engine and fails to
+    # spawn the new one (EX_CONFIG / 203 EXEC). Catch it before mutating
+    # anything. Runs after the release build so first-time installs pass.
+    require_engine_binary() {
+        if [ -z "$1" ] || [ ! -x "$1" ]; then
+            echo "engine binary not found or not executable: ${1:-<unset>}" >&2
+            echo "fix the binary path in $2" >&2
+            echo "expected: {{justfile_directory()}}/target/release/valqeron-engine" >&2
+            exit 1
+        fi
+    }
     case "$(uname -s)" in
     Darwin)
         label="io.valqeron.engine"
         src="$install_dir/$label.plist"
         require_definition "$src"
         plutil -lint "$src" >/dev/null
+        prog="$(plutil -extract ProgramArguments.0 raw -o - "$src")"
+        require_engine_binary "$prog" "$src"
         # Create the default data directory (mirrors
         # ProjectDirs("io","valqeron","valqeron")) for the database and
         # the engine's structured JSON log.
@@ -121,6 +135,8 @@ engine-install:
         unit="valqeron-engine.service"
         src="$install_dir/$unit"
         require_definition "$src"
+        prog="$(sed -n 's/^ExecStart=//p' "$src" | tr -d '"' | awk '{print $1}')"
+        require_engine_binary "$prog" "$src"
         unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
         # The unit sandbox (ReadWritePaths) expects the default data dir; the
         # socket dir is handled by RuntimeDirectory=.

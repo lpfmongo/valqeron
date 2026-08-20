@@ -143,10 +143,10 @@ flowchart TB
 The runtime is event-driven; polling exists only as capped self-healing fallbacks. A seeder that inserted a row wakes
 the dispatcher immediately; a completed run wakes its trigger's seeder (so catch-up is paced by handler speed). For
 pure clock edges: the dispatcher sleeps until the queue's earliest `scheduled_at` (the **watermark**, refreshed inside
-every empty claim, capped at `DISPATCH_MAX_SLEEP = 60s`), and a wall-clock seeder sleeps until its pass hint (a sync
-cooldown expiry, capped at `SEED_FALLBACK_INTERVAL = 600s`). An idle engine touches the database a couple of times per
-hour instead of every second — and a wrong hint degrades to one capped sleep, never a missed run, because the rows
-themselves are the durable alarms.
+every empty claim, capped at `DISPATCH_MAX_SLEEP = 600s`), and a wall-clock seeder sleeps until its pass hint (a sync
+cooldown expiry, capped at `SEED_FALLBACK_INTERVAL = 3600s`). An idle engine touches the database roughly a couple of
+hundred times a day instead of ninety thousand — and a wrong hint degrades to one capped sleep, never a missed run,
+because the rows themselves are the durable alarms.
 
 ## The data model
 

@@ -4,13 +4,13 @@
 
 | Constant | Value | Where | Meaning |
 |---|---|---|---|
-| `DISPATCH_MAX_SLEEP` | 60s | `scheduler/mod.rs` | Cap on the dispatcher's watermark sleep (self-healing fallback) |
+| `DISPATCH_MAX_SLEEP` | 600s | `scheduler/mod.rs` | Cap on the dispatcher's watermark sleep (self-healing fallback; bounds post-suspend lateness in awake time) |
 | `DISPATCH_MIN_SLEEP` | 10ms | `scheduler/mod.rs` | Floor: a stale past watermark naps, never busy-loops |
 | `CLAIM_BATCH` | 8 | `scheduler/mod.rs` | Rows claimed per write-lane call |
 | `EXECUTION_CONCURRENCY` | 2 | `scheduler/mod.rs` | Concurrent handlers per batch |
 | `RETIRED_ERROR` | `"retired: kind no longer registered"` | `scheduler/mod.rs` | Recorded on cancelled rows |
 | `INTERRUPTED_ERROR` | `"interrupted: the engine stopped…"` | `scheduler/mod.rs` | Recorded by crash recovery |
-| `SEED_FALLBACK_INTERVAL` | 600s | `scheduler/trigger/mod.rs` | Wall-clock seeder fallback cap (cooldowns wake precisely via the pass hint) |
+| `SEED_FALLBACK_INTERVAL` | 3600s | `scheduler/trigger/mod.rs` | Wall-clock seeder fallback cap (cooldowns wake precisely via the pass hint; = `MAX_COOLDOWN`, so every hint fits one sleep) |
 | `ESCALATE_AFTER_FAILURES` | 5 | `scheduler/trigger/sync.rs` | `warn` → `error`; the `halted` threshold |
 | Sync builder defaults | 3×300s retry · 300s cooldown · 90d cap | `scheduler/task.rs` | Every source inherits them unless overridden |
 | `MAX_BACKOFF` | 1h | `core/src/tasks` | Retry backoff cap |

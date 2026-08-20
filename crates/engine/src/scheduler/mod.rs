@@ -75,9 +75,12 @@ use crate::storage::AsyncStorage;
 /// Upper bound on the dispatcher's sleep. Dispatch is event-driven — seeds
 /// notify it, and the queue's earliest `scheduled_at` (the watermark,
 /// refreshed on every empty claim) times clock-due rows precisely — so
-/// this cap only self-heals whatever slips past both (a wall-clock jump, a
-/// row inserted outside the scheduler).
-const DISPATCH_MAX_SLEEP: Duration = Duration::from_secs(60);
+/// this cap only self-heals whatever slips past both: a wall-clock jump
+/// (monotonic sleeps pause across laptop suspend, so rows that came due
+/// while the machine slept dispatch within one cap of *awake* time), or a
+/// row inserted outside the scheduler. Ten minutes of worst-case lateness
+/// is immaterial for daily-grained work.
+const DISPATCH_MAX_SLEEP: Duration = Duration::from_secs(600);
 
 /// Floor on the dispatcher's sleep: a stale past watermark must degrade to
 /// a short nap, never a busy loop.

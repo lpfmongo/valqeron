@@ -203,9 +203,9 @@ If every missed period matters, use [Sync](#sync).
 Saturday prune waits until Monday — comfortably inside the 7-day retention window.
 
 `cadence()` returns `(now, SEED_FALLBACK_INTERVAL)`: the first pass runs **immediately at boot** (re-arming never
-waits), a completed run wakes the seeder directly so the next occurrence is armed within milliseconds, and the
-10-minute fallback cap only self-heals a pass that failed transiently — with the armed row as the dispatcher's alarm,
-nothing clock-driven waits on the seeder.
+waits), a completed run wakes the seeder directly so the next occurrence is armed within milliseconds, and the hourly
+fallback cap only self-heals a pass that failed transiently — with the armed row as the dispatcher's alarm, nothing
+clock-driven waits on the seeder.
 
 | Kind | Schedule | Retry |
 |---|---|---|

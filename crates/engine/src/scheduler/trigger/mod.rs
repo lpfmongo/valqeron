@@ -28,9 +28,12 @@ use crate::storage::AsyncStorage;
 /// pass runs immediately at boot, run completions wake them directly, and
 /// cooldown expiries are precise sleeps from the pass's own hint
 /// ([`SeedPass::Idle`]) — this cap only self-heals whatever slips through
-/// (a transiently failed pass, a missed edge). Wall-clock work is
-/// daily-grained; a ten-minute worst case is immaterial.
-pub(crate) const SEED_FALLBACK_INTERVAL: Duration = Duration::from_secs(600);
+/// (a transiently failed pass, a missed edge). One hour aligns with core's
+/// `MAX_COOLDOWN`, so every possible cooldown hint fits inside a single
+/// sleep; wall-clock work is daily-grained, and the next occurrence is
+/// armed as a durable row long before it is due, so an hour of worst-case
+/// seeding lateness is immaterial.
+pub(crate) const SEED_FALLBACK_INTERVAL: Duration = Duration::from_secs(3600);
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

@@ -11,11 +11,11 @@ use valqeron_core::{
 };
 use valqeron_infrastructure::SqliteStorageEngine;
 
-use crate::storage::AsyncStorage;
-use crate::tasks::trigger::{
+use crate::scheduler::trigger::{
     BoxFuture, Interpretation, RetryPolicy, RunWindow, SeedPass, TaskFailure, TaskOutcome,
     TickMode, Tracking, Trigger,
 };
+use crate::storage::AsyncStorage;
 
 pub(crate) struct IntervalTrigger {
     kind: &'static str,
@@ -71,7 +71,7 @@ impl Trigger for IntervalTrigger {
         let kind = TaskKind::new(self.kind)
             .map_err(|e| StorageError::Fault(StorageFault::new(e.to_string())))?;
         if repos.tasks.exists_active(&kind)? {
-            return Ok(SeedPass::Idle);
+            return Ok(SeedPass::Idle { next_pass_at: None });
         }
         let retry = RetryPolicy::none();
         let task = BackgroundTask::builder()
@@ -124,7 +124,7 @@ impl Trigger for IntervalTrigger {
 
 // ================ JITTER ================
 /// Scale a period into 90%..=110% using clock sub-second noise — enough to
-/// desynchronize periodic jobs without pulling in an RNG dependency.
+/// desynchronize periodic tasks without pulling in an RNG dependency.
 fn jittered(base: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::common::{RepositoryResult, Versioned, WriteOutcome};
 use crate::tasks::{
     BackgroundTask, ExecutionOutcome, SyncCursor, SyncSource, TaskCompletion, TaskDeclaration,
-    TaskExecution, TaskId, TaskKind, TaskRegistration, TaskStats,
+    TaskExecution, TaskId, TaskKind, TaskRegistration, TaskSettings, TaskStats,
 };
 
 // ================ QUEUE ================
@@ -54,6 +54,11 @@ pub trait BackgroundTaskRepository {
         now: DateTime<Utc>,
         limit: u32,
     ) -> RepositoryResult<Vec<Versioned<BackgroundTask>>>;
+
+    /// The earliest `Pending` `scheduled_at` among claimable kinds
+    /// (operator-disabled kinds excluded) — the dispatcher's sleep
+    /// watermark. `None` when nothing claimable is queued.
+    fn next_due_at(&self) -> RepositoryResult<Option<DateTime<Utc>>>;
 
     /// Record how a claimed run ended: `Terminal` deletes the row (the
     /// caller inserts the history record), `Retry` requeues it.
@@ -108,6 +113,9 @@ macro_rules! delegate_background_task_repository {
                 limit: u32,
             ) -> RepositoryResult<Vec<Versioned<BackgroundTask>>> {
                 (**self).claim_due(now, limit)
+            }
+            fn next_due_at(&self) -> RepositoryResult<Option<DateTime<Utc>>> {
+                (**self).next_due_at()
             }
             fn complete(
                 &self,
@@ -235,18 +243,19 @@ delegate_task_stat_repository!(Arc<R>);
 // ================ CATALOG ================
 /// Persistence port for the task catalog.
 ///
-/// One row per kind, written only by the engine's task manager (single
+/// One row per kind, written only by the engine's scheduler (single
 /// writer under the instance lock), so plain upserts are enough — no
-/// optimistic versioning. The `paused` flag is additionally flipped by
-/// operators (SQL today, RPC later); those are single-column updates that
-/// cannot conflict with the manager's writes. Run aggregates live on
-/// `task_stat`, not here.
+/// optimistic versioning. The `enabled` flag and the settings columns are
+/// additionally flipped by operators (SQL today, RPC later); those are
+/// narrow updates that cannot conflict with the scheduler's writes. Run
+/// aggregates live on `task_stat`, not here.
 #[cfg_attr(test, mockall::automock)]
-pub trait TaskRegistrationRepository {
+pub trait TaskRegistryRepository {
     /// Upsert a registration from its code declaration. On conflict only
-    /// the declaration columns (category, tier, tracking, schedule, source,
-    /// log policy, `config_enabled`, `registered = 1`) are rewritten —
-    /// operator intent (`paused`) is preserved.
+    /// the identity columns (category, trigger, tracking, schedule, source,
+    /// log policy, `registered = 1`) are rewritten; each settings column is
+    /// filled from the declaration only while NULL. Operator intent
+    /// (`enabled`, non-NULL settings) is preserved.
     fn declare(&self, declaration: &TaskDeclaration, now: DateTime<Utc>) -> RepositoryResult<()>;
 
     /// Mark every currently registered kind NOT in `kinds` as retired.
@@ -263,21 +272,32 @@ pub trait TaskRegistrationRepository {
     /// then kind.
     fn list(&self) -> RepositoryResult<Vec<TaskRegistration>>;
 
-    /// Whether the kind is operator-paused. Unknown kinds are not paused.
-    fn is_paused(&self, kind: &TaskKind) -> RepositoryResult<bool>;
+    /// Whether the kind is enabled. Unknown kinds are enabled — the gate
+    /// must fail open for rows the reconcile has not written yet.
+    fn is_enabled(&self, kind: &TaskKind) -> RepositoryResult<bool>;
 
-    /// Flip the operator pause flag. Returns whether the row existed.
-    fn set_paused(
+    /// Flip the operator enable flag. Returns whether the row existed.
+    fn set_enabled(
         &self,
         kind: &TaskKind,
-        paused: bool,
+        enabled: bool,
+        now: DateTime<Utc>,
+    ) -> RepositoryResult<bool>;
+
+    /// Overwrite the settings columns with `settings` as-is (`None`
+    /// clears a column back to code-owned; the next boot refills the code
+    /// default). Returns whether the row existed.
+    fn update_settings(
+        &self,
+        kind: &TaskKind,
+        settings: &TaskSettings,
         now: DateTime<Utc>,
     ) -> RepositoryResult<bool>;
 }
 
-macro_rules! delegate_task_registration_repository {
+macro_rules! delegate_task_registry_repository {
     ($ty:ty) => {
-        impl<R: TaskRegistrationRepository + ?Sized> TaskRegistrationRepository for $ty {
+        impl<R: TaskRegistryRepository + ?Sized> TaskRegistryRepository for $ty {
             fn declare(
                 &self,
                 declaration: &TaskDeclaration,
@@ -298,24 +318,32 @@ macro_rules! delegate_task_registration_repository {
             fn list(&self) -> RepositoryResult<Vec<TaskRegistration>> {
                 (**self).list()
             }
-            fn is_paused(&self, kind: &TaskKind) -> RepositoryResult<bool> {
-                (**self).is_paused(kind)
+            fn is_enabled(&self, kind: &TaskKind) -> RepositoryResult<bool> {
+                (**self).is_enabled(kind)
             }
-            fn set_paused(
+            fn set_enabled(
                 &self,
                 kind: &TaskKind,
-                paused: bool,
+                enabled: bool,
                 now: DateTime<Utc>,
             ) -> RepositoryResult<bool> {
-                (**self).set_paused(kind, paused, now)
+                (**self).set_enabled(kind, enabled, now)
+            }
+            fn update_settings(
+                &self,
+                kind: &TaskKind,
+                settings: &TaskSettings,
+                now: DateTime<Utc>,
+            ) -> RepositoryResult<bool> {
+                (**self).update_settings(kind, settings, now)
             }
         }
     };
 }
 
-delegate_task_registration_repository!(Box<R>);
-delegate_task_registration_repository!(Rc<R>);
-delegate_task_registration_repository!(Arc<R>);
+delegate_task_registry_repository!(Box<R>);
+delegate_task_registry_repository!(Rc<R>);
+delegate_task_registry_repository!(Arc<R>);
 
 // ================ SYNC CURSORS ================
 /// Persistence port for sync-source progress cursors.

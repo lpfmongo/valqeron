@@ -1,12 +1,14 @@
 # Overview
 
 The engine runs recurring background work — database maintenance, liveness pings, run-history pruning, market-data
-ingestion — through one small framework behind one door: `crate::tasks`. Register a `TaskDefinition` (a typed builder
-per *trigger*), hand it a handler, and everything else comes for free.
+ingestion — through one small scheduler behind one door: `crate::scheduler`. Register a `TaskDefinition` (a typed
+builder per *trigger*), hand it a handler, and everything else comes for free. Every task known to the code registers
+unconditionally; the `task_registry` row — operator-editable, preserved across restarts — decides whether it runs
+(`enabled`) and owns its tunable settings, with the code supplying only defaults.
 
 | Concern              | Mechanism                                                       |
 |----------------------|-----------------------------------------------------------------|
-| **Registration**     | `BackgroundTasks::builder().task(TaskDefinition::…)`            |
+| **Registration**     | `Scheduler::builder().task(TaskDefinition::…)`                  |
 | **Scheduling**       | Three *triggers* — interval, recurring, sync                    |
 | **Durability**       | Live work is a row in `task_queue`; the row *is* the alarm      |
 | **Retries**          | Per-run attempt budget with capped exponential backoff          |
@@ -15,7 +17,7 @@ per *trigger*), hand it a handler, and everything else comes for free.
 | **Crash recovery**   | `RUNNING` rows at boot are requeued or recorded as failed       |
 | **Catalog**          | Every registered kind persisted in `task_registry`              |
 | **Status**           | Derived on read from catalog ⋈ queue ⋈ stats ⋈ cursors          |
-| **Operator control** | `paused` flag (persisted) + per-task worker stop/start (runtime)|
+| **Operator control** | `enabled` flag + settings (persisted) + worker stop/start (runtime) |
 | **Observability**    | Per-run spans, category-tagged audit events, log policy         |
 | **Data sync**        | Cursors, sequential catch-up, cooldowns, halt-on-failure        |
 
@@ -61,7 +63,7 @@ flowchart LR
 flowchart TB
     subgraph ENGINE_SYSTEM
         direction LR
-        A["db_maintenance<br/><i>interval 1h ±10%, durable</i>"]
+        A["db_maintenance<br/><i>interval 8h ±10%, durable</i>"]
         B["heartbeat<br/><i>interval 5m, ephemeral</i>"]
         C["task_prune<br/><i>recurring daily 03:00Z</i>"]
         D["sd_watchdog<br/><i>interval, ephemeral<br/>only under systemd</i>"]
@@ -71,7 +73,8 @@ flowchart TB
     end
 ```
 
-Categories (`ENGINE_SYSTEM`, `FINANCE_DATA_SYNC`, `OTHER`) are classification, not behaviour — they drive grouping, log
+The cadences shown are the code defaults; the registry's settings columns override them per task. Categories
+(`ENGINE_SYSTEM`, `FINANCE_DATA_SYNC`, `OTHER`) are classification, not behaviour — they drive grouping, log
 filtering, and defaults.
 
 ## The two guarantees worth internalising
@@ -92,5 +95,5 @@ prune-proofness holds for the per-kind aggregates in `task_stat`.
 - [Architecture](./architecture.md) — the façade, the data model, and the life of a run
 - [Triggers](./triggers.md) — interval, recurring, and sync in depth
 - [Adding a Task](./adding-a-task.md) — the practical walkthrough
-- [Operations](./operations.md) — config, status, pause, troubleshooting, scenarios
+- [Operations](./operations.md) — settings, status, enable/disable, troubleshooting, scenarios
 - [Reference](./reference.md) — constants, schemas, invariants

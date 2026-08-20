@@ -109,6 +109,11 @@ pub(crate) fn exists_active(
 
 /// Ids of due `PENDING` tasks, oldest due first. Claiming is a separate
 /// per-id guarded update; both run under the same writer guard.
+///
+/// Kinds an operator disabled in the registry are skipped — their armed
+/// rows freeze in place and thaw when the kind is re-enabled. Kinds with
+/// no registry row still claim, so an orphaned row fails loudly instead of
+/// sitting forever.
 pub(crate) fn due_ids(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -117,6 +122,7 @@ pub(crate) fn due_ids(
     let mut stmt = conn.prepare_cached(
         "SELECT id FROM task_queue
          WHERE status = 'PENDING' AND scheduled_at <= ?1
+           AND kind NOT IN (SELECT kind FROM task_registry WHERE enabled = 0)
          ORDER BY scheduled_at, id LIMIT ?2",
     )?;
     stmt.query_map(params![canonical_timestamp(now), limit], |row| {
@@ -126,6 +132,20 @@ pub(crate) fn due_ids(
             .map_err(|e| crate::sqlite::row::conversion_failure(0, rusqlite::types::Type::Blob, e))
     })?
     .collect()
+}
+
+/// The earliest claimable `PENDING` `scheduled_at` — the dispatcher's sleep
+/// watermark. Mirrors the claim's enabled filter so a disabled kind's
+/// frozen rows never produce a past watermark (and a hot dispatcher loop).
+pub(crate) fn next_due_at(conn: &Connection) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT MIN(scheduled_at) AS next_due FROM task_queue
+         WHERE status = 'PENDING'
+           AND kind NOT IN (SELECT kind FROM task_registry WHERE enabled = 0)",
+    )?;
+    stmt.query_row([], |row| {
+        crate::sqlite::row::column_opt_datetime(row, "next_due")
+    })
 }
 
 /// Claim one due task: `PENDING → RUNNING`, counting the attempt. The status

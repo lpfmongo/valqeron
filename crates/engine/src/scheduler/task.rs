@@ -4,22 +4,22 @@
 //!
 //! Builders carry the framework's defaults (an interval task is durable
 //! with jitter; a sync source retries 3×300s with a 300s cooldown base and
-//! a 90-day backfill cap) so a job states only what makes it different.
-//! Every builder has two terminals: [`run`](IntervalTaskBuilder::run) binds
-//! a handler and yields the definition, and
-//! [`disabled`](IntervalTaskBuilder::disabled) yields the catalog
-//! declaration for a task configured off this boot — same source of truth,
-//! no hand-rolled declarations.
+//! a 90-day backfill cap) so a task states only what makes it different.
+//! The `run` terminal binds a handler and yields the definition; the
+//! definition's [`TaskSettings`] are the code defaults the boot reconcile
+//! seeds into the registry — the DB values (operator-editable) are what
+//! actually schedule the task.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use valqeron_core::{
-    CooldownPolicy, LogPolicy, Schedule, SyncSource, TaskCategory, TaskDeclaration, TaskKind,
+    CooldownPolicy, LogPolicy, Schedule, SyncSource, TaskCategory, TaskKind, TaskSettings,
 };
 
-use crate::tasks::trigger::{
-    self, BoxFuture, RetryPolicy, TaskContext, TaskOutcome, Tracking, Trigger, TriggerConfig,
+use crate::scheduler::trigger::{
+    BoxFuture, RetryPolicy, TaskContext, TaskOutcome, Tracking, Trigger, TriggerConfig,
 };
 
 /// Sync defaults, shared by every source unless overridden: transient
@@ -61,6 +61,9 @@ pub(crate) struct TaskDefinition {
     pub(crate) category: TaskCategory,
     pub(crate) trigger: TriggerConfig,
     pub(crate) log_policy: LogPolicy,
+    /// Code-default settings seeded into the registry on first declare;
+    /// `None` fields are code-owned forever (never captured in the DB).
+    pub(crate) settings: TaskSettings,
     pub(crate) handler: Arc<dyn TaskHandler>,
 }
 
@@ -75,6 +78,7 @@ impl TaskDefinition {
             jitter: true,
             tracking: Tracking::Durable,
             log_policy: None,
+            pinned: false,
         }
     }
 
@@ -107,60 +111,54 @@ impl TaskDefinition {
         }
     }
 
-    /// Split into the boot declaration and the runtime registration.
-    /// `None` when the kind fails validation — the caller logs and skips.
-    pub(crate) fn into_parts(self) -> Option<(TaskDeclaration, Registration)> {
+    /// Validate the kind and split into the reconcile input. `None` when
+    /// the kind fails validation — the caller logs and skips.
+    pub(crate) fn validate(self) -> Option<PendingTask> {
         let kind = TaskKind::new(self.kind).ok()?;
-        let declaration = TaskDeclaration {
+        Some(PendingTask {
             kind,
-            category: self.category,
-            trigger: self.trigger.trigger_kind(),
-            tracking: self.trigger.tracking(),
-            schedule: self.trigger.descriptor(),
-            source: self.trigger.source(),
-            log_policy: self.log_policy,
-            config_enabled: true,
-        };
-        let registration = Registration {
+            kind_str: self.kind,
             category: self.category,
             log_policy: self.log_policy,
+            defaults: self.settings,
+            config: self.trigger,
+            enabled: true,
             handler: self.handler,
-            trigger: trigger::build(self.kind, self.trigger),
-        };
-        Some((declaration, registration))
+        })
     }
+}
+
+/// A validated definition on its way through the boot reconcile: the code
+/// config plus the declaration facts. The reconcile folds the registry's
+/// stored settings into `config` and captures the row's `enabled` flag
+/// before the trigger is built.
+#[derive(Clone)]
+pub(crate) struct PendingTask {
+    pub(crate) kind: TaskKind,
+    pub(crate) kind_str: &'static str,
+    pub(crate) category: TaskCategory,
+    pub(crate) log_policy: LogPolicy,
+    /// Code-default settings (the declaration payload).
+    pub(crate) defaults: TaskSettings,
+    /// The trigger config; code values until the reconcile merges the
+    /// stored settings in.
+    pub(crate) config: TriggerConfig,
+    /// The row's committed `enabled` flag (true until the reconcile reads
+    /// otherwise).
+    pub(crate) enabled: bool,
+    pub(crate) handler: Arc<dyn TaskHandler>,
 }
 
 /// The runtime form of a definition: what the runner holds per kind.
 pub(crate) struct Registration {
     pub(crate) category: TaskCategory,
     pub(crate) log_policy: LogPolicy,
+    /// In-memory image of the registry's committed `enabled` flag: read by
+    /// every durable seed pass (no DB round trip), published to only after
+    /// a successful registry write. Ephemeral runs ignore it (liveness).
+    pub(crate) enabled: AtomicBool,
     pub(crate) handler: Arc<dyn TaskHandler>,
     pub(crate) trigger: Arc<dyn Trigger>,
-}
-
-/// The declaration of a task configured off this boot: cataloged as
-/// `disabled` instead of silently absent. `None` when the kind is invalid.
-fn disabled_declaration(
-    kind: &'static str,
-    category: TaskCategory,
-    log_policy: LogPolicy,
-    config: &TriggerConfig,
-) -> Option<TaskDeclaration> {
-    let Ok(kind) = TaskKind::new(kind) else {
-        tracing::error!(kind, "invalid task kind; cannot declare it disabled");
-        return None;
-    };
-    Some(TaskDeclaration {
-        kind,
-        category,
-        trigger: config.trigger_kind(),
-        tracking: config.tracking(),
-        schedule: config.descriptor(),
-        source: config.source(),
-        log_policy,
-        config_enabled: false,
-    })
 }
 
 // ================ INTERVAL BUILDER ================
@@ -173,6 +171,9 @@ pub(crate) struct IntervalTaskBuilder {
     /// Resolved at the terminal: `All` for durable, `FailuresOnly` for
     /// ephemeral, unless set explicitly.
     log_policy: Option<LogPolicy>,
+    /// When set, the period is code-owned: the registry never captures it
+    /// and operators cannot tune it.
+    pinned: bool,
 }
 
 impl IntervalTaskBuilder {
@@ -182,11 +183,19 @@ impl IntervalTaskBuilder {
     }
 
     /// Run inline without persisting rows (liveness work): no history, no
-    /// retries, `paused` ignored — and precise cadence (jitter off) with
-    /// quiet logging (`FailuresOnly`) by default.
+    /// retries, the `enabled` gate ignored — and precise cadence (jitter
+    /// off) with quiet logging (`FailuresOnly`) by default.
     pub fn ephemeral(mut self) -> Self {
         self.tracking = Tracking::Ephemeral;
         self.jitter = false;
+        self
+    }
+
+    /// Keep the period code-owned: it is computed at boot (e.g. from the
+    /// systemd watchdog contract) and must not be operator-tunable, so the
+    /// registry's `period_secs` stays NULL forever.
+    pub fn pinned(mut self) -> Self {
+        self.pinned = true;
         self
     }
 
@@ -241,30 +250,28 @@ impl IntervalTaskBuilder {
         }
     }
 
+    /// The code-default settings: the period, unless pinned. Periods that
+    /// do not fit a positive whole-second column (sub-second test cadences,
+    /// absurdly large values) stay code-owned.
+    fn settings(&self) -> TaskSettings {
+        TaskSettings {
+            period_secs: (!self.pinned)
+                .then(|| u32::try_from(self.period.as_secs()).ok())
+                .flatten()
+                .filter(|secs| *secs > 0),
+            ..TaskSettings::default()
+        }
+    }
+
     pub fn run(self, handler: impl TaskHandler) -> TaskDefinition {
         TaskDefinition {
             kind: self.kind,
             category: self.category,
             log_policy: self.resolved_log_policy(),
+            settings: self.settings(),
             trigger: self.config(),
             handler: Arc::new(handler),
         }
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "terminal parity across builders; interval tasks are never env-disabled today"
-        )
-    )]
-    pub fn disabled(self) -> Option<TaskDeclaration> {
-        disabled_declaration(
-            self.kind,
-            self.category,
-            self.resolved_log_policy(),
-            &self.config(),
-        )
     }
 }
 
@@ -319,20 +326,14 @@ impl RecurringTaskBuilder {
             kind: self.kind,
             category: self.category,
             log_policy: self.log_policy,
+            settings: TaskSettings {
+                at_local: Some(self.schedule.at()),
+                recurrence: Some(self.schedule.recurrence()),
+                ..TaskSettings::default()
+            },
             trigger: self.config(),
             handler: Arc::new(handler),
         }
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "terminal parity across builders; recurring tasks are never env-disabled today"
-        )
-    )]
-    pub fn disabled(self) -> Option<TaskDeclaration> {
-        disabled_declaration(self.kind, self.category, self.log_policy, &self.config())
     }
 }
 
@@ -391,13 +392,16 @@ impl SyncTaskBuilder {
             kind: self.kind,
             category: self.category,
             log_policy: self.log_policy,
+            settings: TaskSettings {
+                at_local: Some(self.schedule.at()),
+                recurrence: Some(self.schedule.recurrence()),
+                cooldown_secs: Some(self.cooldown_secs),
+                max_backfill_days: Some(self.max_backfill_days),
+                ..TaskSettings::default()
+            },
             trigger: self.config(),
             handler: Arc::new(handler),
         }
-    }
-
-    pub fn disabled(self) -> Option<TaskDeclaration> {
-        disabled_declaration(self.kind, self.category, self.log_policy, &self.config())
     }
 }
 
@@ -468,6 +472,13 @@ mod tests {
             definition.trigger.descriptor(),
             "recurring:daily@03:00+00:00"
         );
+        assert_eq!(
+            definition.settings.at_local,
+            NaiveTime::from_hms_opt(3, 0, 0),
+            "recurring settings capture the schedule"
+        );
+        assert_eq!(definition.settings.recurrence, Some(Recurrence::Daily));
+        assert_eq!(definition.settings.period_secs, None);
 
         let overridden = TaskDefinition::recurring("t", utc_daily())
             .retry(RetryPolicy {
@@ -477,42 +488,44 @@ mod tests {
             .log_failures_only()
             .run(|_ctx| async { TaskOutcome::Done });
         assert_eq!(overridden.log_policy, LogPolicy::FailuresOnly);
-
-        let declaration = TaskDefinition::recurring("t", utc_daily())
-            .disabled()
-            .expect("valid kind");
-        assert_eq!(declaration.trigger, TaskTrigger::Recurring);
-        assert!(!declaration.config_enabled);
     }
 
     #[test]
-    fn sync_defaults_and_disabled_declaration_share_one_source_of_truth() {
+    fn sync_definition_captures_defaults_as_settings() {
         let source = SyncSource::new("cvm").unwrap();
-        let declaration = TaskDefinition::sync("cvm_daily_sync", source.clone(), schedule())
-            .disabled()
-            .expect("valid kind");
-        assert_eq!(declaration.kind.as_str(), "cvm_daily_sync");
-        assert_eq!(declaration.category, TaskCategory::FinanceDataSync);
-        assert_eq!(declaration.trigger, TaskTrigger::Sync);
-        assert_eq!(declaration.tracking, TaskTracking::Durable);
-        assert_eq!(declaration.schedule, "sync:daily@07:00-03:00");
-        assert_eq!(
-            declaration.source.map(|s| s.as_str().to_owned()),
-            Some("cvm".into())
-        );
-        assert!(!declaration.config_enabled);
-
-        // The run terminal derives the identical shape, enabled.
         let definition = TaskDefinition::sync("cvm_daily_sync", source, schedule())
             .category(TaskCategory::Other)
             .cooldown_secs(600)
             .max_backfill_days(30)
             .run(|_ctx| async { TaskOutcome::Done });
-        let (declared, registration) = definition.into_parts().expect("valid kind");
-        assert!(declared.config_enabled);
-        assert_eq!(declared.schedule, "sync:daily@07:00-03:00");
-        assert_eq!(declared.category, TaskCategory::Other, "category override");
-        assert_eq!(registration.category, TaskCategory::Other);
+        assert_eq!(definition.trigger.descriptor(), "sync:daily@07:00-03:00");
+        assert_eq!(definition.settings.cooldown_secs, Some(600));
+        assert_eq!(definition.settings.max_backfill_days, Some(30));
+        assert_eq!(definition.settings.recurrence, Some(Recurrence::Daily));
+
+        let pending = definition.validate().expect("valid kind");
+        assert_eq!(pending.kind.as_str(), "cvm_daily_sync");
+        assert_eq!(pending.category, TaskCategory::Other, "category override");
+        assert_eq!(
+            pending.config.source().map(|s| s.as_str().to_owned()),
+            Some("cvm".into())
+        );
+    }
+
+    #[test]
+    fn interval_settings_capture_the_period_unless_pinned() {
+        let tunable = TaskDefinition::interval("t", Duration::from_secs(3600))
+            .run(|_ctx| async { TaskOutcome::Done });
+        assert_eq!(tunable.settings.period_secs, Some(3600));
+
+        let pinned = TaskDefinition::interval("t", Duration::from_secs(3600))
+            .ephemeral()
+            .pinned()
+            .run(|_ctx| async { TaskOutcome::Done });
+        assert_eq!(
+            pinned.settings.period_secs, None,
+            "pinned periods stay code-owned"
+        );
     }
 
     #[test]
@@ -524,18 +537,13 @@ mod tests {
             }
         }
         let definition = TaskDefinition::interval("t", Duration::from_secs(1)).run(Probe);
-        assert!(definition.into_parts().is_some());
+        assert!(definition.validate().is_some());
     }
 
     #[test]
-    fn invalid_kinds_yield_no_parts_and_no_declaration() {
+    fn invalid_kinds_yield_no_pending_task() {
         let definition = TaskDefinition::interval("", Duration::from_secs(1))
             .run(|_ctx| async { TaskOutcome::Done });
-        assert!(definition.into_parts().is_none());
-        assert!(
-            TaskDefinition::interval("", Duration::from_secs(1))
-                .disabled()
-                .is_none()
-        );
+        assert!(definition.validate().is_none());
     }
 }

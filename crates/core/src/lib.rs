@@ -91,19 +91,19 @@ pub use listing::{
 
 pub use calendar::MarketCalendar;
 
-pub use schedule::{Recurrence, Schedule, TargetPeriod};
+pub use schedule::{Recurrence, RecurrenceParseError, Schedule, TargetPeriod};
 
 pub use tasks::repository::{
     BackgroundTaskRepository, SyncCursorRepository, TaskExecutionRepository,
-    TaskRegistrationRepository, TaskStatRepository,
+    TaskRegistryRepository, TaskStatRepository,
 };
 
 pub use tasks::{
     BackgroundTask, BackgroundTaskBuilder, BackgroundTaskSnapshot, CooldownPolicy,
     DerivedTaskStatus, ExecutionOutcome, LogPolicy, SyncCursor, SyncCursorSnapshot, SyncOutcome,
     SyncOutcomeKind, SyncSource, TaskCategory, TaskCompletion, TaskDeclaration, TaskExecution,
-    TaskId, TaskKind, TaskRegistration, TaskRegistrationSnapshot, TaskStats, TaskStatus,
-    TaskStatusEntry, TaskTracking, TaskTrigger, derive_status,
+    TaskId, TaskKind, TaskRegistration, TaskRegistrationSnapshot, TaskSettings, TaskStats,
+    TaskStatus, TaskStatusEntry, TaskTracking, TaskTrigger, derive_status,
     error::{
         ExecutionOutcomeError, LogPolicyError, SyncOutcomeKindError, SyncSourceError,
         TaskBuilderError, TaskCategoryError, TaskKindError, TaskStatusError, TaskTrackingError,

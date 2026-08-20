@@ -15,11 +15,11 @@ use valqeron_core::{
 };
 use valqeron_infrastructure::SqliteStorageEngine;
 
-use crate::storage::AsyncStorage;
-use crate::tasks::trigger::{
-    BoxFuture, Interpretation, RECONCILE_INTERVAL, RetryPolicy, RunWindow, SeedPass, TaskFailure,
-    TaskOutcome, TickMode, Trigger,
+use crate::scheduler::trigger::{
+    BoxFuture, Interpretation, RetryPolicy, RunWindow, SEED_FALLBACK_INTERVAL, SeedPass,
+    TaskFailure, TaskOutcome, TickMode, Trigger,
 };
+use crate::storage::AsyncStorage;
 
 pub(crate) struct RecurringTrigger {
     kind: &'static str,
@@ -44,7 +44,7 @@ impl RecurringTrigger {
 impl Trigger for RecurringTrigger {
     fn cadence(&self) -> (tokio::time::Instant, Duration) {
         // First pass immediately: reseeding after a restart must not wait.
-        (tokio::time::Instant::now(), RECONCILE_INTERVAL)
+        (tokio::time::Instant::now(), SEED_FALLBACK_INTERVAL)
     }
 
     fn mode(&self) -> TickMode {
@@ -63,7 +63,9 @@ impl Trigger for RecurringTrigger {
         let kind = TaskKind::new(self.kind)
             .map_err(|e| StorageError::Fault(StorageFault::new(e.to_string())))?;
         if repos.tasks.exists_active(&kind)? {
-            return Ok(SeedPass::Idle);
+            // The armed row is the dispatcher's alarm; the seeder has
+            // nothing clock-driven pending until the completion wake.
+            return Ok(SeedPass::Idle { next_pass_at: None });
         }
         let Some(slot) = self.schedule.next_occurrence_after(now) else {
             return Err(StorageError::Fault(StorageFault::new(format!(

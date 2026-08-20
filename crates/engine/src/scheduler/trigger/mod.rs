@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use valqeron_core::{
-    CooldownPolicy, Repositories, Schedule, StorageError, SyncSource, TargetPeriod, TaskTracking,
-    TaskTrigger,
+    CooldownPolicy, Repositories, Schedule, StorageError, SyncSource, TargetPeriod, TaskSettings,
+    TaskTracking, TaskTrigger,
 };
 use valqeron_infrastructure::SqliteStorageEngine;
 
@@ -26,9 +26,11 @@ use crate::storage::AsyncStorage;
 
 /// Fallback cadence of the wall-clock seeders (recurring + sync): the first
 /// pass runs immediately at boot, run completions wake them directly, and
-/// this interval only covers clock-driven transitions (a future slot
-/// becoming due, a cooldown expiring).
-pub(crate) const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+/// cooldown expiries are precise sleeps from the pass's own hint
+/// ([`SeedPass::Idle`]) — this cap only self-heals whatever slips through
+/// (a transiently failed pass, a missed edge). Wall-clock work is
+/// daily-grained; a ten-minute worst case is immaterial.
+pub(crate) const SEED_FALLBACK_INTERVAL: Duration = Duration::from_secs(600);
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -134,11 +136,12 @@ impl RetryPolicy {
 
 /// Everything the manager needs to know about a task's tier — and nothing
 /// more.
+#[derive(Clone)]
 pub(crate) enum TriggerConfig {
     /// Monotonic interval since boot (liveness and housekeeping work).
     Interval {
         period: Duration,
-        /// ±10% period jitter so periodic jobs do not synchronize.
+        /// ±10% period jitter so periodic tasks do not synchronize.
         jitter: bool,
         tracking: Tracking,
     },
@@ -204,6 +207,57 @@ impl TriggerConfig {
             TriggerConfig::Sync { schedule, .. } => format!("sync:{}", schedule.descriptor()),
         }
     }
+
+    /// The code config with the registry's stored settings folded in:
+    /// every `Some` overrides the corresponding knob, every `None` keeps
+    /// the code value. Calendars, jitter, tracking, and retry policies are
+    /// never DB-tunable.
+    pub fn with_settings(self, settings: &TaskSettings) -> Self {
+        match self {
+            TriggerConfig::Interval {
+                period,
+                jitter,
+                tracking,
+            } => TriggerConfig::Interval {
+                period: settings
+                    .period_secs
+                    .map(|secs| Duration::from_secs(u64::from(secs)))
+                    .unwrap_or(period),
+                jitter,
+                tracking,
+            },
+            TriggerConfig::Recurring { schedule, retry } => TriggerConfig::Recurring {
+                schedule: schedule_with(schedule, settings),
+                retry,
+            },
+            TriggerConfig::Sync {
+                source,
+                schedule,
+                retry,
+                cooldown,
+                max_backfill_days,
+            } => TriggerConfig::Sync {
+                source,
+                schedule: schedule_with(schedule, settings),
+                retry,
+                cooldown: settings
+                    .cooldown_secs
+                    .map(CooldownPolicy::new)
+                    .unwrap_or(cooldown),
+                max_backfill_days: settings.max_backfill_days.unwrap_or(max_backfill_days),
+            },
+        }
+    }
+}
+
+/// `schedule` with the stored time-of-day/recurrence overrides applied;
+/// the market calendar is identity, never a setting.
+fn schedule_with(schedule: Schedule, settings: &TaskSettings) -> Schedule {
+    Schedule::new(
+        *schedule.calendar(),
+        settings.at_local.unwrap_or_else(|| schedule.at()),
+        settings.recurrence.unwrap_or_else(|| schedule.recurrence()),
+    )
 }
 
 // ================ SEEDING ================
@@ -216,15 +270,19 @@ pub(crate) enum TickMode {
     Inline,
 }
 
-/// What one seeding pass decided — for the manager's generic logging.
+/// What one seeding pass decided — for the manager's generic logging and
+/// the seeder's next sleep. (The operator enable gate lives in the
+/// manager's memory and never reaches the triggers: a disabled kind's pass
+/// is skipped entirely.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SeedPass {
     /// A row was inserted; the dispatcher should wake.
     Seeded,
-    /// Nothing to do (active run, cooldown, future slot already armed…).
-    Idle,
-    /// Operator-paused (produced by the manager's gate, not by triggers).
-    Paused,
+    /// Nothing seeded. `next_pass_at` is the trigger's own clock edge (a
+    /// cooldown expiry, an advanced-past slot to retry immediately);
+    /// `None` means nothing is pending before the next wake or the
+    /// fallback tick.
+    Idle { next_pass_at: Option<DateTime<Utc>> },
 }
 
 // ================ THE TRAIT ================

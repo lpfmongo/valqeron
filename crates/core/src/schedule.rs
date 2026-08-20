@@ -45,6 +45,38 @@ impl std::fmt::Display for Recurrence {
     }
 }
 
+/// A recurrence text (`daily`, `weekly:mon`) did not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid recurrence; expected `daily` or `weekly:<mon..sun>`")]
+pub struct RecurrenceParseError;
+
+impl std::str::FromStr for Recurrence {
+    type Err = RecurrenceParseError;
+
+    /// Parses the exact vocabulary [`Display`](Self) renders: `daily` or
+    /// `weekly:<mon..sun>` (case-insensitive), so stored values round-trip.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lowered = s.trim().to_lowercase();
+        if lowered == "daily" {
+            return Ok(Recurrence::Daily);
+        }
+        let day = lowered
+            .strip_prefix("weekly:")
+            .ok_or(RecurrenceParseError)?;
+        let on = match day {
+            "mon" => Weekday::Mon,
+            "tue" => Weekday::Tue,
+            "wed" => Weekday::Wed,
+            "thu" => Weekday::Thu,
+            "fri" => Weekday::Fri,
+            "sat" => Weekday::Sat,
+            "sun" => Weekday::Sun,
+            _ => return Err(RecurrenceParseError),
+        };
+        Ok(Recurrence::Weekly { on })
+    }
+}
+
 // ================ TARGET PERIOD ================
 /// The span of civil dates one run is responsible for, inclusive on both
 /// ends. Under [`Recurrence::Daily`] this collapses to a single date.

@@ -21,6 +21,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use valqeron_core::{
+    LogPolicy, StorageEngine, TaskCategory, TaskDeclaration, TaskKind, TaskRegistryRepository,
+    TaskSettings, TaskTracking, TaskTrigger,
+};
+use valqeron_infrastructure::{DatabaseConfig, SqliteStorageEngine};
+
 const BIN: &str = env!("CARGO_BIN_EXE_valqeron-engine");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -101,8 +107,6 @@ fn engine_command(db: &Path) -> Command {
     cmd.env_remove("RUST_LOG")
         .env_remove("VALQERON_ENGINE_LOG_LEVEL")
         .env_remove("VALQERON_ENGINE_DURABLE")
-        .env_remove("VALQERON_ENGINE_MAINTENANCE_INTERVAL")
-        .env_remove("VALQERON_ENGINE_HEARTBEAT_INTERVAL")
         .env_remove("NOTIFY_SOCKET")
         .env_remove("WATCHDOG_USEC")
         .env_remove("WATCHDOG_PID")
@@ -119,30 +123,45 @@ fn socket_path(db: &Path) -> PathBuf {
     db.with_extension("sock")
 }
 
-fn spawn_engine(db: &Path, maintenance_secs: &str, heartbeat_secs: &str) -> Engine {
-    spawn_engine_with(db, maintenance_secs, heartbeat_secs, &[])
+/// Task cadence is registry state, not environment configuration: pre-seed
+/// the catalog row with an operator `period_secs` override before the
+/// binary boots. The engine's reconcile rewrites the identity columns but
+/// preserves this non-NULL setting — exactly the operator-tuning path.
+fn tune_task_period(db: &Path, kind: &str, period_secs: u32) {
+    let engine =
+        SqliteStorageEngine::open(db, DatabaseConfig::default()).expect("open fixture database");
+    let repos = engine.repositories();
+    let declaration = TaskDeclaration {
+        kind: TaskKind::new(kind).expect("valid kind"),
+        category: TaskCategory::EngineSystem,
+        trigger: TaskTrigger::Interval,
+        tracking: TaskTracking::Durable,
+        schedule: format!("interval:{period_secs}s"),
+        source: None,
+        log_policy: LogPolicy::All,
+        settings: TaskSettings {
+            period_secs: Some(period_secs),
+            ..TaskSettings::default()
+        },
+    };
+    repos
+        .registry
+        .declare(&declaration, chrono::Utc::now())
+        .expect("declare fixture row");
+}
+
+fn spawn_engine(db: &Path) -> Engine {
+    spawn_engine_with(db, &[])
 }
 
 /// Like [`spawn_engine`] with debug-level stderr (`RUST_LOG=debug`), for
 /// tests that observe debug-only lines such as the heartbeat.
-fn spawn_engine_verbose(db: &Path, maintenance_secs: &str, heartbeat_secs: &str) -> Engine {
-    spawn_engine_with(
-        db,
-        maintenance_secs,
-        heartbeat_secs,
-        &[("RUST_LOG", "debug")],
-    )
+fn spawn_engine_verbose(db: &Path) -> Engine {
+    spawn_engine_with(db, &[("RUST_LOG", "debug")])
 }
 
-fn spawn_engine_with(
-    db: &Path,
-    maintenance_secs: &str,
-    heartbeat_secs: &str,
-    extra_env: &[(&str, &str)],
-) -> Engine {
+fn spawn_engine_with(db: &Path, extra_env: &[(&str, &str)]) -> Engine {
     let mut child = engine_command(db)
-        .env("VALQERON_ENGINE_MAINTENANCE_INTERVAL", maintenance_secs)
-        .env("VALQERON_ENGINE_HEARTBEAT_INTERVAL", heartbeat_secs)
         .envs(extra_env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -210,8 +229,10 @@ fn any_argument_is_rejected() {
 #[test]
 fn starts_heartbeats_and_shuts_down_cleanly_on_sigterm() {
     let (_dir, db) = temp_db();
-    // The heartbeat logs at debug level; spawn with `-v` so it reaches stderr.
-    let mut engine = spawn_engine_verbose(&db, "3600", "1");
+    // A 1s heartbeat via the registry (the default is 300s); it logs at
+    // debug level, so spawn verbose so it reaches stderr.
+    tune_task_period(&db, "heartbeat", 1);
+    let mut engine = spawn_engine_verbose(&db);
 
     // Heartbeat proves the run loop (and thus the signal handlers) is live.
     engine.wait_for_line("engine alive");
@@ -305,8 +326,6 @@ fn sd_notify_reports_ready_watchdog_pings_and_stopping() {
     let notify_socket = notify_path.to_str().expect("utf-8 path").to_string();
     let mut engine = spawn_engine_with(
         &db,
-        "3600",
-        "3600",
         &[
             ("NOTIFY_SOCKET", notify_socket.as_str()),
             // 1s watchdog → WATCHDOG=1 every 500ms.
@@ -323,9 +342,11 @@ fn sd_notify_reports_ready_watchdog_pings_and_stopping() {
 }
 
 #[test]
-fn maintenance_job_runs_on_its_interval() {
+fn maintenance_task_runs_on_its_interval() {
     let (_dir, db) = temp_db();
-    let mut engine = spawn_engine(&db, "1", "3600");
+    // A 1s maintenance interval via the registry (the default is 8h).
+    tune_task_period(&db, "db_maintenance", 1);
+    let mut engine = spawn_engine(&db);
 
     engine.wait_for_line("maintenance completed");
 
@@ -336,7 +357,7 @@ fn maintenance_job_runs_on_its_interval() {
 #[test]
 fn second_instance_fails_fast_naming_holder() {
     let (_dir, db) = temp_db();
-    let mut first = spawn_engine(&db, "3600", "3600");
+    let mut first = spawn_engine(&db);
     first.wait_for_line("engine ready");
 
     let second = engine_command(&db)
@@ -371,7 +392,7 @@ fn sigkill_leaves_stale_lock_file_that_never_blocks_the_next_start() {
     let (_dir, db) = temp_db();
     let lock = lock_path(&db);
 
-    let mut first = spawn_engine(&db, "3600", "3600");
+    let mut first = spawn_engine(&db);
     first.wait_for_line("engine ready");
     let first_pid = first.pid();
 
@@ -382,7 +403,7 @@ fn sigkill_leaves_stale_lock_file_that_never_blocks_the_next_start() {
         "SIGKILL leaves the lock file behind (kernel lock is released)"
     );
 
-    let mut second = spawn_engine(&db, "3600", "3600");
+    let mut second = spawn_engine(&db);
     second.wait_for_line("engine ready");
     let recorded = std::fs::read_to_string(&lock).expect("lock readable");
     assert_eq!(

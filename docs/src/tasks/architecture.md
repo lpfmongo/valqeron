@@ -1,16 +1,16 @@
 # Architecture
 
-Three layers, two hard boundaries: **the manager knows nothing about any individual task**, and **tasks know nothing
+Three layers, two hard boundaries: **the scheduler knows nothing about any individual task**, and **tasks know nothing
 about scheduling**. Adding a data source (ANBIMA, B3, SEC) is one new file plus one composition line — it inherits
-catch-up, cooldowns, pause/resume, status, and log filtering unchanged.
+catch-up, cooldowns, enable/disable, status, and log filtering unchanged.
 
-`crate::tasks` is the feature's only door. Jobs and the engine composition see the façade — `BackgroundTasks`,
+`crate::scheduler` is the feature's only door. Task modules and the engine composition see the façade — `Scheduler`,
 `TaskDefinition` builders, and the handler contract — and nothing else; the `trigger` module is private.
 
 ```text
-═══════════ LAYER 1: TASK IMPLEMENTATIONS — the manager must NOT know these ═══════════
+═══════════ LAYER 1: TASK IMPLEMENTATIONS — the scheduler must NOT know these ═════════
                                                                                        
-  jobs/system.rs                     jobs/cvm.rs                    jobs/<future>.rs   
+  tasks/system.rs                    tasks/cvm.rs                   tasks/<future>.rs  
   ENGINE_SYSTEM                      FINANCE_DATA_SYNC              OTHER              
   db_maintenance, heartbeat,         CVM handler                    e.g. report_export 
   task_prune, sd_watchdog            + later: its own tables                           
@@ -31,16 +31,17 @@ catch-up, cooldowns, pause/resume, status, and log filtering unchanged.
                         · interpret · on_terminal · wake                               
 ═══════════ LAYER 3: THE RUNTIME — generic, knows nothing above ═══════════════════════
                                                                                        
-   BackgroundTasks(Builder)   TaskWorkerManager        TaskContextRunner               
-   catalog reconcile,         one stoppable seeder     storage gateway; seed passes,   
-   crash recovery,            loop per kind + the      claim, execute in task_run      
-   start/drain facade,        dispatcher; per-task     spans, terminal move, trigger   
-   stop/start/kick/statuses   stop · start · drain     hooks                           
+   Scheduler(Builder)         TaskWorkerManager        TaskContextRunner               
+   catalog reconcile          one stoppable seeder     storage gateway; seed passes,   
+   (settings merge),          loop per kind + the      claim, execute in task_run      
+   crash recovery,            dispatcher; per-task     spans, terminal move, trigger   
+   start/drain facade,        stop · start · drain     hooks                           
+   stop/start/kick/statuses                                                            
                                                                                        
 ═══════════════════════════ ENGINE DB (valqeron.db, WAL) ══════════════════════════════
   task_registry     task_queue      task_execution   task_stat      <task-owned tables>
   catalog + intent  live work only  run history      aggregates,    invisible to L2/L3 
-                                    (pruned @ 7d)    never pruned                      
+  + settings                        (pruned @ 7d)    never pruned                      
 ```
 
 | Layer | Knows | Must never know |
@@ -49,10 +50,10 @@ catch-up, cooldowns, pause/resume, status, and log filtering unchanged.
 | **Trigger** | its own scheduling semantics and state table (sync → `sync_cursor`) | what handlers do, task-owned tables |
 | **Task** | its handler, its config, its own tables | other tasks, runtime internals |
 
-Enforced structurally, not by convention: the `trigger` module is private to `tasks/`, `tasks/` imports nothing from
-`jobs/`, and a grep for `cvm` in `tasks/` returns only test fixture strings. `core` holds every pure decision
-(business-day math, retry backoff, cooldown growth, status derivation) in one module — `core/src/tasks/` — and stays
-tokio-free, enforced by `just deps-check`; the engine owns the clocks, the loops, and the I/O.
+Enforced structurally, not by convention: the `trigger` module is private to `scheduler/`, `scheduler/` imports
+nothing from `tasks/`, and a grep for `cvm` in `scheduler/` returns only test fixture strings. `core` holds every pure
+decision (business-day math, retry backoff, cooldown growth, status derivation) in one module — `core/src/tasks/` —
+and stays tokio-free, enforced by `just deps-check`; the engine owns the clocks, the loops, and the I/O.
 
 ## The contract
 
@@ -81,11 +82,11 @@ enum TaskOutcome {
 
 One handler contract for every task under every trigger. Handlers never parse payloads — the trigger does that once
 and hands over typed values in `window`. What a task *is* travels as a `TaskDefinition`, produced by one typed builder
-per trigger kind (see [Adding a Task](./adding-a-task.md)); the builders carry the framework defaults and also produce
-the catalog declaration for env-disabled tasks (`.disabled()`), so there is one source of truth for both paths.
+per trigger kind (see [Adding a Task](./adding-a-task.md)); the builders carry the framework defaults and capture the
+task's code-default `TaskSettings`, which the boot reconcile seeds into the registry.
 
 The seam that erases trigger-specific knowledge from the runtime is the `Trigger` trait
-(`crates/engine/src/tasks/trigger/mod.rs`):
+(`crates/engine/src/scheduler/trigger/mod.rs`):
 
 ```rust,ignore
 trait Trigger: Send + Sync {
@@ -93,7 +94,7 @@ trait Trigger: Send + Sync {
     fn mode(&self) -> TickMode;                    // Seed | Inline
 
     // Runs INSIDE the runner's single write transaction, after the
-    // paused gate — so gate and insert cannot race.
+    // enable gate — so gate and insert cannot race.
     fn reconcile(&self, repos: &Repositories<..>, now) -> Result<SeedPass, StorageError>;
 
     fn window_for(&self, payload: Option<&str>) -> Result<RunWindow, String>;
@@ -105,12 +106,12 @@ trait Trigger: Send + Sync {
 }
 ```
 
-Because `reconcile` receives the repositories and returns a verdict, the runner can wrap it in a transaction and a
-pause check without understanding what the trigger did inside.
+Because `reconcile` receives the repositories and returns a verdict, the runner can wrap it in a transaction and an
+enable check without understanding what the trigger did inside.
 
 ## Runtime topology
 
-Each registration gets one seeder loop — individually stoppable via `BackgroundTasks::stop/start(kind)` — and there is
+Each registration gets one seeder loop — individually stoppable via `Scheduler::stop/start(kind)` — and there is
 exactly one dispatcher.
 
 ```mermaid
@@ -139,9 +140,13 @@ flowchart TB
     S4 -->|"runs handler inline<br/>no rows"| H
 ```
 
-Two notifications replace polling: a seeder that inserted a row wakes the dispatcher immediately (instead of its
-1-second poll), and a completed run wakes its trigger's seeder (so catch-up is paced by handler speed, not the
-60-second tick).
+The runtime is event-driven; polling exists only as capped self-healing fallbacks. A seeder that inserted a row wakes
+the dispatcher immediately; a completed run wakes its trigger's seeder (so catch-up is paced by handler speed). For
+pure clock edges: the dispatcher sleeps until the queue's earliest `scheduled_at` (the **watermark**, refreshed inside
+every empty claim, capped at `DISPATCH_MAX_SLEEP = 60s`), and a wall-clock seeder sleeps until its pass hint (a sync
+cooldown expiry, capped at `SEED_FALLBACK_INTERVAL = 600s`). An idle engine touches the database a couple of times per
+hour instead of every second — and a wrong hint degrades to one capped sleep, never a missed run, because the rows
+themselves are the durable alarms.
 
 ## The data model
 
@@ -150,19 +155,23 @@ One concern per table; a terminal run **moves** rather than mutates in place:
 ```text
 ┌─ task_registry ─────────────┐   ┌─ task_queue ────────────────┐
 │ catalog + operator intent   │   │ LIVE work only              │
-│ declaration (code-owned,    │   │ status ∈ PENDING | RUNNING  │
+│ identity (code-owned,       │   │ status ∈ PENDING | RUNNING  │
 │  overwritten at boot):      │   │ attempts/max, retry delay,  │
 │  category trigger_kind      │   │ payload, version guard      │
 │  tracking schedule source   │   │ rows leave on completion ──┐│
-│  log_policy config_enabled  │   └─────────────────────────── ││
-│ intent (preserved): paused, │                    terminal move│
-│  registered                 │   ┌─ task_execution ───────────▼┐
-└─────────────────────────────┘   │ history: 1 row per terminal │
-┌─ task_stat ─────────────────┐   │  run; outcome ∈ SUCCEEDED | │
-│ prune-proof aggregates:     │◄──│  NOT_READY | FAILED;        │
-│ totals, durations, last_*   │   │  attempts, duration_ms      │
-│ NEVER pruned                │   │ pruned after 7 days         │
-└─────────────────────────────┘   └─────────────────────────────┘
+│  log_policy                 │   └─────────────────────────── ││
+│ intent (preserved): enabled │                    terminal move│
+│ settings (NULL=code-owned): │   ┌─ task_execution ───────────▼┐
+│  period_secs at_local       │   │ history: 1 row per terminal │
+│  recurrence cooldown_secs   │   │  run; outcome ∈ SUCCEEDED | │
+│  max_backfill_days          │   │  NOT_READY | FAILED;        │
+│ registered (boot-owned)     │   │  attempts, duration_ms      │
+└─────────────────────────────┘   │ pruned after 7 days         │
+┌─ task_stat ─────────────────┐   └─────────────────────────────┘
+│ prune-proof aggregates:     │◄── terminal runs fold here
+│ totals, durations, last_*   │
+│ NEVER pruned                │
+└─────────────────────────────┘
           sync_cursor — per-source progress, never pruned
 ```
 
@@ -172,11 +181,15 @@ CREATE TABLE task_registry (
     category            TEXT NOT NULL,   -- ENGINE_SYSTEM|FINANCE_DATA_SYNC|OTHER
     trigger_kind        TEXT NOT NULL,   -- INTERVAL|RECURRING|SYNC
     tracking            TEXT NOT NULL,   -- DURABLE|EPHEMERAL
-    schedule            TEXT NOT NULL,   -- display-only descriptor, never parsed back
+    schedule            TEXT NOT NULL,   -- display-only descriptor of the EFFECTIVE schedule
     source              TEXT,            -- sync trigger: the sync_cursor key
     log_policy          TEXT NOT NULL DEFAULT 'ALL',
-    config_enabled      INTEGER NOT NULL DEFAULT 1,   -- env verdict
-    paused              INTEGER NOT NULL DEFAULT 0,   -- operator intent
+    enabled             INTEGER NOT NULL DEFAULT 1,   -- operator intent, boot-preserved
+    period_secs         INTEGER,         -- interval trigger        ─┐
+    at_local            TEXT,            -- recurring/sync, HH:MM    │ settings:
+    recurrence          TEXT,            -- daily | weekly:<day>     │ NULL = code-owned,
+    cooldown_secs       INTEGER,         -- sync                     │ non-NULL = DB truth
+    max_backfill_days   INTEGER,         -- sync                    ─┘
     registered          INTEGER NOT NULL DEFAULT 1,   -- 0 = retired
     first_registered_at TEXT NOT NULL,
     updated_at          TEXT NOT NULL
@@ -185,16 +198,20 @@ CREATE TABLE task_registry (
 
 Facts that matter:
 
-- **`runs = registered && config_enabled && !paused`.** Three switches, deliberately distinct: *"does the code still
-  ship this?"*, *"is this deployment configured for it?"*, *"did someone temporarily stop it?"*.
-- **Every catalog column has one owner.** Declaration columns are rewritten by the boot reconcile; only `paused`
-  survives it. Run aggregates live on `task_stat`, so the reconcile never has to tiptoe around columns it does not own.
+- **`runs = registered && enabled`.** Two switches, deliberately distinct: *"does the code still ship this?"* and
+  *"did an operator turn it off?"*. There is no env switch — every task the code ships registers at every boot.
+- **Every catalog column has one owner.** Identity columns are rewritten by the boot reconcile; `enabled` and non-NULL
+  settings survive it (each settings column is `COALESCE`-filled from the code default only while NULL). Run
+  aggregates live on `task_stat`, so the reconcile never has to tiptoe around columns it does not own.
+- **`NULL` settings mean code-owned.** A task that declares a knob tunable seeds its default on first boot; a task
+  that pins a knob (`sd_watchdog`'s period follows the systemd contract) leaves the column NULL forever. Clearing a
+  column back to NULL is "reset to default" — the next boot refills it. Unparseable hand-edits are logged and read as
+  unset, never a boot failure.
 - **`task_stat` is the prune-proof memory.** `task_prune` deletes `task_execution` rows after 7 days; the stats row —
   totals, failure counts, durations, `last_success_at` — is never deleted and survives retirement, exactly like the
   sync cursor.
-- **Disabled is still declared.** A task configured off via env gets a catalog row (`config_enabled = 0`) through the
-  builder's `.disabled()` terminal, so an operator can tell "off by config" from "never existed" — history, stats, and
-  cursor stay intact for re-enabling.
+- **Disabled is still declared.** A disabled task keeps its catalog row (`enabled = 0`), so an operator can tell
+  "turned off" from "never existed" — history, stats, and cursor stay intact for re-enabling.
 
 ### Boot reconcile
 
@@ -210,17 +227,23 @@ sequenceDiagram
 
     B->>R: RUNNING rows are orphans
     R->>DB: requeue (attempts left), or move to<br/>task_execution as FAILED + count in stats
-    B->>T: declarations from code
-    loop each declaration
-        T->>DB: declare (upsert; preserve paused)
+    B->>T: validated definitions from code
+    loop each definition
+        T->>DB: read stored settings
+        T->>T: merge into the code config<br/>(effective schedule)
+        T->>DB: declare (upsert; preserve enabled,<br/>COALESCE-fill NULL settings)
     end
     T->>DB: retire_missing(kinds) → retired[]
     loop each retired kind
         T->>DB: take_pending → task_execution rows<br/>("retired: kind no longer registered")
     end
-    T-->>B: declared / retired / cancelled counts
-    B->>B: spawn seeders + dispatcher
+    T-->>B: effective configs per kind
+    B->>B: build triggers from effective configs,<br/>spawn seeders + dispatcher
 ```
+
+The triggers are built **after** the reconcile, from the merged (DB-effective) configs — an operator's stored period
+or schedule override is what actually runs, and the `schedule` descriptor written back shows it. If the reconcile
+transaction itself cannot run, the engine boots on code defaults rather than refusing to start.
 
 **Retirement, not deletion.** A kind that disappears from code is marked `registered = 0`; its catalog row and stats
 survive forever, and its leftover `PENDING` rows move to the history as failed — recorded as cancellations, **not**
@@ -248,8 +271,9 @@ sequenceDiagram
     participant T as trigger
     participant H as handler
 
-    Note over S: tick, wake, or boot
-    S->>DB: txn { is_paused? · trigger.reconcile }
+    Note over S: sleep elapsed, wake, or boot
+    S->>S: enabled? (in-memory gate)
+    S->>DB: txn { trigger.reconcile }
     DB-->>S: Seeded
     S-->>D: notify
 
@@ -280,8 +304,8 @@ The non-obvious guarantees at each stage:
 
 | Stage | Guarantee |
 |---|---|
-| Seed (1–3) | Pause gate and `trigger.reconcile` share **one write transaction** — they cannot race |
-| Claim (4–6) | Select-then-claim under one writer guard; the per-row `WHERE status='PENDING'` guard makes double-dispatch impossible; batch runs at `EXECUTION_CONCURRENCY = 2` *across* kinds, serial within one |
+| Seed (1–4) | The enable gate is the in-memory image of the *committed* registry flag (writes go through `Scheduler::set_enabled`: commit first, publish after) — a disabled kind's pass costs one atomic load and zero DB work |
+| Claim (5–6) | Select-then-claim under one writer guard; kinds with `enabled = 0` are skipped in SQL (armed rows freeze until re-enabled — the DB-truth backstop); the per-row `WHERE status='PENDING'` guard makes double-dispatch impossible; batch runs at `EXECUTION_CONCURRENCY = 2` *across* kinds, serial within one; the final empty claim refreshes the dispatcher's sleep watermark |
 | Execute (7–10) | Handler runs inside a `task_run{kind, category}` span; sees typed `RunWindow`, never a payload |
 | Interpret (11–12) | Trigger applies its side effects and reports what the history should record — `NotReady` is a first-class result ("waited" is not "worked"), never a failure; a failed cursor write turns a successful handler into a failed run |
 | Complete (13) | The terminal **move** is one transaction: version-guarded queue `DELETE`, `task_execution` `INSERT`, `task_stat` fold — applied only when the guarded delete matched. Retries stay in the queue as an `UPDATE`; only terminal outcomes reach history and stats |
@@ -318,7 +342,7 @@ SIGTERM / SIGINT
    │
    ├─ lifecycle → Stopping (sd_notify STOPPING=1)
    ├─ gRPC server stops accepting, drains in-flight RPCs
-   ├─ BackgroundTasks::drain — watch flip stops every seeder + the dispatcher
+   ├─ Scheduler::drain — watch flip stops every seeder + the dispatcher
    ├─ bounded drain (DRAIN_TIMEOUT = 10s) waits for running handlers
    └─ storage closed, runtime shut down (RUNTIME_SHUTDOWN_TIMEOUT = 20s)
 ```

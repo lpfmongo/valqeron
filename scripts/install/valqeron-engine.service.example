@@ -42,24 +42,18 @@ RuntimeDirectory=valqeron
 # Extend this list if you override any of the VALQERON_* paths below.
 ReadWritePaths=%h/.local/share/valqeron %t/valqeron
 # Optional overrides, shown at the engine's own defaults. Uncomment to
-# customize. Intervals are whole seconds; VALQERON_ENGINE_LOG_FILE=off
-# disables the JSON file log; a truthy VALQERON_ENGINE_DURABLE (e.g. 1)
-# switches writes to strict durability (PRAGMA synchronous=FULL, slower).
+# customize. VALQERON_ENGINE_LOG_FILE=off disables the JSON file log; a
+# truthy VALQERON_ENGINE_DURABLE (e.g. 1) switches writes to strict
+# durability (PRAGMA synchronous=FULL, slower).
+#
+# Background tasks are NOT configured here: enablement and scheduling live
+# in the database's task_registry table (operator-editable, preserved
+# across restarts) — see docs/src/tasks/operations.md.
 # Environment="VALQERON_DB=%h/.local/share/valqeron/valqeron.db"
 # Environment="VALQERON_SOCKET=%t/valqeron/valqeron.sock"
 # Environment="VALQERON_ENGINE_LOG_FILE=%h/.local/share/valqeron/engine.log"
 # Environment="VALQERON_ENGINE_LOG_LEVEL=info"
 # Environment="VALQERON_ENGINE_DURABLE=0"
-# Environment="VALQERON_ENGINE_MAINTENANCE_INTERVAL=3600"
-# Environment="VALQERON_ENGINE_HEARTBEAT_INTERVAL=300"
-# CVM daily sync: VALQERON_ENGINE_SYNC_CVM=off disables; _AT is market-local
-# HH:MM (America/Sao_Paulo); _SCHEDULE is "daily" or "weekly:<mon..sun>";
-# _COOLDOWN is the failure-cooldown base in seconds.
-# Environment="VALQERON_ENGINE_SYNC_CVM=on"
-# Environment="VALQERON_ENGINE_SYNC_CVM_AT=07:00"
-# Environment="VALQERON_ENGINE_SYNC_CVM_SCHEDULE=daily"
-# Environment="VALQERON_ENGINE_SYNC_CVM_COOLDOWN=300"
-# Environment="VALQERON_ENGINE_SYNC_MAX_BACKFILL_DAYS=90"
 
 [Install]
 WantedBy=default.target

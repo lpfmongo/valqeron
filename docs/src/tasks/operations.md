@@ -1,38 +1,42 @@
 # Operations
 
-Running, tuning, and troubleshooting the task framework.
+Running, tuning, and troubleshooting the task scheduler.
 
 ## Configuration
 
-All configuration is environment variables, set in the service definition (`scripts/install/*.example`). Unset or empty
-means "use the default"; a *set, non-empty, invalid* value makes the engine **refuse to start** — a misconfiguration
-must never silently become a default.
+Task configuration is **registry state, not environment state**. Every task the code ships registers at every boot;
+the `task_registry` row owns whether it runs (`enabled`) and its tunable settings. Code declares only defaults: on
+first boot they are seeded into the row, and from then on the row is the truth — the boot reconcile rewrites identity
+columns but never touches `enabled` or a non-NULL setting.
 
-| Variable | Default | Meaning |
+| Column | Applies to | Meaning |
 |---|---|---|
-| `VALQERON_ENGINE_MAINTENANCE_INTERVAL` | `3600` | `db_maintenance` period, seconds |
-| `VALQERON_ENGINE_HEARTBEAT_INTERVAL` | `300` | `heartbeat` period, seconds |
-| `VALQERON_ENGINE_LOG_LEVEL` | `info` | JSON file-log filter (see below) |
-| `VALQERON_ENGINE_LOG_FILE` | `<data>/engine.log` | `off`/`false`/`0`/`none` disables |
+| `enabled` | all | `0` stops seeding **and** dispatching; preserved across boots |
+| `period_secs` | interval | seconds between runs (`db_maintenance` default 28800 = 8h, `heartbeat` 300) |
+| `at_local` | recurring, sync | market-local `HH:MM` (`cvm_daily_sync` default `07:00`) |
+| `recurrence` | recurring, sync | `daily` or `weekly:<mon..sun>` |
+| `cooldown_secs` | sync | failure-cooldown base, seconds (default 300) |
+| `max_backfill_days` | sync | unattended catch-up bound (default 90) |
 
-Sync sources are namespaced per source, so adding a source adds a namespace:
+`NULL` means code-owned: the next boot refills the code default (so clearing a column is "reset to default"), and a
+task that pins a knob — `sd_watchdog`'s period follows the systemd `WATCHDOG_USEC` contract — keeps it `NULL` forever.
+Unparseable hand-edits are logged and read as unset; they never stop the engine.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `VALQERON_ENGINE_SYNC_CVM` | enabled | `off`/`false`/`0`/`none` disables |
-| `VALQERON_ENGINE_SYNC_CVM_AT` | `07:00` | market-local `HH:MM` |
-| `VALQERON_ENGINE_SYNC_CVM_SCHEDULE` | `daily` | `daily` or `weekly:<mon..sun>` |
-| `VALQERON_ENGINE_SYNC_CVM_COOLDOWN` | `300` | failure-cooldown base, seconds |
-| `VALQERON_ENGINE_SYNC_MAX_BACKFILL_DAYS` | `90` | unattended catch-up bound |
+**While the engine runs, the engine owns the row.** `enabled` is read into memory at boot and mutated only through
+`Scheduler::set_enabled` (the future RPC's backend): committed to the registry first, published to the in-memory gate
+after, effective immediately. Settings are read once at boot and apply at the next start. Raw-SQL edits against a
+*live* engine are unsupported — edit with the engine stopped. The only task-adjacent environment variables left are
+the engine-wide ones (`VALQERON_ENGINE_LOG_LEVEL`, `VALQERON_ENGINE_LOG_FILE` — see
+[Logging control](#logging-control)).
 
-Disabling a source does not erase it: the catalog keeps a row with `config_enabled = 0`, status `disabled`, and its
-cursor, stats, and history intact.
+Disabling a task does not erase it: the catalog keeps the row (`enabled = 0`, status `disabled`) and its cursor,
+stats, and history stay intact.
 
 ## Status
 
 A task's status is **never stored** — it is derived on every read by `derive_status`, a pure function in
 `crates/core/src/tasks/mod.rs` (no clock, no I/O, exhaustively unit-tested), so it cannot go stale. In-process,
-`BackgroundTasks::statuses()` assembles the full view (registration + status + next run + stats + cursor).
+`Scheduler::statuses()` assembles the full view (registration + status + next run + stats + cursor).
 
 ```mermaid
 flowchart LR
@@ -43,21 +47,20 @@ flowchart LR
     F["task_stat<br/><i>totals, last run</i>"] -.->|display| E
 ```
 
-First match wins — the order encodes precedence (operator/config decisions beat queue contents; "executing right now"
-beats sync detail; `halted` is the escalated form of `cooling_down`):
+First match wins — the order encodes precedence (operator decisions beat queue contents; "executing right now" beats
+sync detail; `halted` is the escalated form of `cooling_down`):
 
 | # | Status | Condition |
 |---|---|---|
 | 1 | `retired` | `registered = 0` |
-| 2 | `disabled` | `config_enabled = 0` |
-| 3 | `paused` | `paused = 1` |
-| 4 | `running` | a queue row is `RUNNING` |
-| 5 | `halted` | sync: `consecutive_failures ≥ 5` |
-| 6 | `cooling_down` | sync: `cooldown_until > now` |
-| 7 | `catching_up` | sync: a queued row is past due |
-| 8 | `waiting` | queued row `scheduled_at > now` |
-| 9 | `due` | queued row past due (non-sync) |
-| 10 | `idle` | nothing queued — normal for ephemeral tasks, transient for durable ones |
+| 2 | `disabled` | `enabled = 0` |
+| 3 | `running` | a queue row is `RUNNING` |
+| 4 | `halted` | sync: `consecutive_failures ≥ 5` |
+| 5 | `cooling_down` | sync: `cooldown_until > now` |
+| 6 | `catching_up` | sync: a queued row is past due |
+| 7 | `waiting` | queued row `scheduled_at > now` |
+| 8 | `due` | queued row past due (non-sync) |
+| 9 | `idle` | nothing queued — normal for ephemeral tasks, transient for durable ones |
 
 A healthy engine mid-morning on a Wednesday, and the same engine after CVM has been failing:
 
@@ -74,7 +77,7 @@ Until the `ListTasks` RPC and `vq engine tasks` land, the raw joins:
 ```sql
 -- catalog + stats + next run
 SELECT r.kind, r.category, r.schedule,
-       r.registered, r.config_enabled, r.paused,
+       r.registered, r.enabled,
        s.last_outcome, s.total_runs, s.total_failures, s.last_success_at,
        (SELECT MIN(scheduled_at) FROM task_queue q
          WHERE q.kind = r.kind AND q.status = 'PENDING') AS next_run_at
@@ -94,38 +97,36 @@ SELECT source, through_slot, through_target,
 FROM sync_cursor;
 ```
 
-## Pause, resume, and worker control
+## Enable, disable, and worker control
 
-`paused` is operator intent, persisted across restarts and independent of configuration. Pause stops the *scheduler*,
-not the *runtime* — restarting the engine is never required in either direction.
+`enabled` is operator intent, persisted across restarts. Disabling stops the *scheduling*, not the *runtime* —
+restarting the engine is never required in either direction.
 
 ```text
-pause  ─► stops SEEDING within ≤60s (the seeder's fallback tick)
-       ─► an already-armed row still fires
-       ─► an in-flight run finishes normally
+set_enabled(kind, false) ─► registry committed, then the in-memory gate published
+                         ─► seeding stops immediately (zero DB work per skipped pass)
+                         ─► dispatching stops at the next claim: armed rows freeze
+                         ─► an in-flight run finishes normally
 
-resume ─► seeding restarts at the next tick
-       ─► sync sources catch up sequentially from the cursor
+set_enabled(kind, true)  ─► committed + published + seeder and dispatcher woken
+                         ─► frozen rows thaw and dispatch immediately
+                         ─► sync sources catch up sequentially from the cursor
 ```
 
-> **Interim story:** there is no CLI or RPC yet, so pause is flipped by writing the row directly. This is safe against
-> a live engine — WAL mode plus the repositories' busy-retry handle the concurrency.
+> **Interim story:** the CLI/RPC surface is not built yet; `Scheduler::set_enabled` is its complete in-process
+> backend. On a *stopped* engine the flag can be edited directly (`UPDATE task_registry SET enabled = 0, updated_at =
+> strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE kind = '…';`) — the next boot reads it into memory. Editing a **live**
+> engine's row is unsupported: seeding follows the in-memory flag (only the claim's SQL filter would notice).
 
-```sql
-UPDATE task_registry
-   SET paused = 1,   -- 0 to resume
-       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
- WHERE kind = 'cvm_daily_sync';
-```
+Settings edits are stopped-engine edits too (`UPDATE task_registry SET period_secs = 600 WHERE kind =
+'db_maintenance';`) and apply at the next start — triggers are built from the row once, at boot.
 
-A paused-then-resumed sync source costs nothing extra: resume walks the missed periods in order through exactly the
-same catch-up path as an outage. **Ephemeral tasks ignore `paused`** — `heartbeat` and `sd_watchdog` are liveness work;
-pausing the watchdog would let systemd's `WatchdogSec` kill the engine.
+A disabled-then-re-enabled sync source costs nothing extra: it walks the missed periods in order through exactly the
+same catch-up path as an outage. **Ephemeral tasks ignore `enabled`** — `heartbeat` and `sd_watchdog` are liveness
+work; disabling the watchdog would let systemd's `WatchdogSec` kill the engine.
 
-In-process, `BackgroundTasks` additionally exposes **runtime worker control** — `stop(kind)` / `start(kind)` halt and
-respawn one kind's seeder loop (same semantics as `paused`: armed rows still fire), and `kick(kind)` wakes a seeder
-immediately instead of waiting its fallback tick. These are the building blocks for the pause RPC: flip the flag, then
-kick.
+In-process, `Scheduler` additionally exposes **runtime worker control** — `stop(kind)` / `start(kind)` halt and
+respawn one kind's seeder loop, and `kick(kind)` wakes a seeder ahead of its fallback sleep.
 
 ## Logging control
 
@@ -158,7 +159,7 @@ stderr):
 **A task is not running:**
 
 ```sql
-SELECT r.registered, r.config_enabled, r.paused, s.last_outcome, s.last_error
+SELECT r.registered, r.enabled, r.schedule, s.last_outcome, s.last_error
 FROM task_registry r LEFT JOIN task_stat s ON s.kind = r.kind
 WHERE r.kind = '<kind>';
 ```
@@ -166,8 +167,8 @@ WHERE r.kind = '<kind>';
 | Symptom | Cause | Fix |
 |---|---|---|
 | `registered = 0` | kind removed from code | expected after an upgrade |
-| `config_enabled = 0` | disabled by env | unset the `*_SYNC_*` off-value |
-| `paused = 1` | operator paused it | resume (above) |
+| `enabled = 0` | operator disabled it | re-enable (above) |
+| unexpected `schedule` | a stored settings override | clear the column to NULL to reset to the code default |
 | all clean, no rows | possibly cooling down | check `sync_cursor` |
 
 **A sync source is stuck** — query `sync_cursor` (see [Status](#status)):
@@ -196,14 +197,16 @@ Each is covered by an automated test; the mechanics behind them are in [Triggers
 | Scenario | What happens | Test |
 |---|---|---|
 | **Ten-day outage** | Every missed business day synced in order, one at a time, paced by handler speed; then the future slot is armed | `ten_missed_business_days_backfill_sequentially_in_order` |
-| **Pause Tue, resume Fri** | Wed's already-armed row still fires; no seeding while paused; resume walks Thu+Fri via the normal catch-up path, `paused → catching_up → waiting` within a minute | `paused_source_resumes_with_sequential_catchup`, `paused_kind_seeds_nothing_until_resumed` |
-| **Disabled by config** (`VALQERON_ENGINE_SYNC_CVM=off`) | Catalog row stays visible as `disabled` via the builder's `.disabled()` declaration; no seeder; cursor, stats, and history untouched | `boot_reconcile_registers_the_catalog` |
+| **One success per day** | A successful sync advances the cursor past today's slot and arms strictly the next business-day occurrence — the same day can never run twice successfully | `successful_run_arms_the_next_business_day_not_today` |
+| **Disable Tue, re-enable Fri** | Wed's already-armed row freezes (the claim skips it); no seeding while disabled; re-enable through `set_enabled` thaws the row immediately and walks Thu+Fri via the normal catch-up path | `disabled_source_resumes_with_sequential_catchup`, `disabled_kind_seeds_nothing_until_reenabled`, `armed_rows_of_a_disabled_kind_freeze_until_reenabled` |
+| **Operator tunes a schedule** | Stopped engine: `UPDATE task_registry SET period_secs = …` (or `at_local`/`recurrence`); the next boot builds the trigger from the stored value and writes the effective descriptor back | `stored_settings_override_code_defaults_at_boot` |
+| **A future row comes due** | No polling: the dispatcher sleeps until the queue's earliest `scheduled_at` (watermark), capped at 60s | `future_row_dispatches_via_the_watermark_not_the_fallback` |
 | **Source starts failing** | 3 attempts (+5/+10 min), terminal `FAILED` moves to history; cursor holds; cooldown doubles per failure (5→10→20→40→60 min capped); at 5 failures log escalates to `error`, status `halted`; nothing after the failing period runs | `terminal_failure_halts_on_the_same_slot_with_cooldown`, `zero_cooldown_retries_the_same_slot_and_counts_failures` |
 | **Not published yet** | `NotReady`: history records `NOT_READY`, cursor holds, cooldown set, failures **not** counted, status `cooling_down`; retried after the cooldown | `not_ready_holds_the_cursor_without_burning_failures` |
 | **Upgrade removes a task** | Boot reconcile retires the kind, moves its `PENDING` rows to history as cancellations (stats untouched — they never ran), preserves catalog + stats forever; a later re-add revives it with totals intact | `retired_kinds_are_marked_and_their_pending_rows_cancelled` |
-| **Fresh install** | Cold start: cursor seeded one occurrence back; exactly one run (the latest period), then steady state | `cold_start_runs_only_the_most_recent_period` |
+| **Fresh install** | Cold start: every task registers enabled with its code defaults; a sync cursor is seeded one occurrence back — exactly one run (the latest period), then steady state | `boot_reconcile_registers_the_catalog`, `cold_start_runs_only_the_most_recent_period` |
 | **Cursor 412 days behind** | Beyond `max_backfill_days`: reseeded to cold start, one run, `WARN operation="sync_skip"` — no unattended grind through a year | `stale_cursor_beyond_the_cap_skips_ahead_to_the_latest` |
 | **Crash between cursor advance and completion** | Recovery requeues the row; the same period re-runs from its payload; the idempotent upsert and cursor advance are no-ops | `crash_between_handler_success_and_completion_reruns_idempotently` |
-| **Crash mid-run, budget spent** | Recovery moves the row to history as `FAILED "interrupted…"` — and it counts in the stats | `recovery_requeues_or_takes_by_attempt_budget` |
+| **Crash mid-run, budget spent** | Recovery moves the row to history as `FAILED "interrupted…"` — and it counts in the stats | `startup_recovers_rows_left_running_by_a_previous_process` |
 | **Worker stopped at runtime** | `stop(kind)` halts that seeder (armed rows still fire); `start(kind)` respawns it; other kinds unaffected | `worker_handles_stop_and_restart_one_kind` |
 | **Two sources, one behind** | Independent cursors, seeders, cooldowns; a halted source never blocks another; the dispatcher interleaves at concurrency 2 | `two_sources_advance_independently` |

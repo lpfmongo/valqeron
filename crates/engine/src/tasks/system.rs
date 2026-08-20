@@ -1,6 +1,6 @@
 //! ENGINE_SYSTEM tasks: the engine's own housekeeping and liveness work.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::NaiveTime;
 use tokio::sync::watch;
@@ -9,9 +9,8 @@ use valqeron_core::{
 };
 use valqeron_infrastructure::SqliteStorageEngine;
 
-use crate::engine::EngineConfig;
 use crate::lifecycle::LifecycleState;
-use crate::tasks::{BackgroundTasksBuilder, TaskContext, TaskDefinition, TaskOutcome};
+use crate::scheduler::{SchedulerBuilder, TaskContext, TaskDefinition, TaskOutcome};
 
 /// Task kinds this module registers — also the `kind` values persisted in
 /// the task tables (the ephemeral kinds never persist rows).
@@ -19,6 +18,13 @@ pub(crate) const DB_MAINTENANCE_TASK: &str = "db_maintenance";
 pub(crate) const HEARTBEAT_TASK: &str = "heartbeat";
 pub(crate) const TASK_PRUNE_TASK: &str = "task_prune";
 pub(crate) const SD_WATCHDOG_TASK: &str = "sd_watchdog";
+
+/// Code-default periods, seeded into the registry on first boot; the
+/// registry's `period_secs` (operator-tunable) is what actually runs.
+/// Maintenance every 8 hours: a WAL checkpoint + optimize three times a
+/// day is plenty for a reference-data write load.
+const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(28_800);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How long execution-history rows are kept before `task_prune` deletes
 /// them.
@@ -39,19 +45,18 @@ fn task_prune_at() -> NaiveTime {
 /// maintenance, the wall-clock history prune, the ephemeral heartbeat, and
 /// (under a systemd watchdog) the ephemeral watchdog ping.
 pub(crate) fn register(
-    builder: BackgroundTasksBuilder,
-    config: &EngineConfig,
+    builder: SchedulerBuilder,
     started: Instant,
     state: watch::Receiver<LifecycleState>,
-) -> BackgroundTasksBuilder {
+) -> SchedulerBuilder {
     let builder = builder
         .task(
-            TaskDefinition::interval(DB_MAINTENANCE_TASK, config.maintenance_interval())
+            TaskDefinition::interval(DB_MAINTENANCE_TASK, DEFAULT_MAINTENANCE_INTERVAL)
                 .category(TaskCategory::EngineSystem)
                 .run(|ctx: TaskContext| async move {
                     match ctx
                         .storage
-                        .maintenance(DB_MAINTENANCE_TASK, run_maintenance_job)
+                        .maintenance(DB_MAINTENANCE_TASK, run_maintenance)
                         .await
                     {
                         Ok(Ok(())) => TaskOutcome::Done,
@@ -61,7 +66,7 @@ pub(crate) fn register(
                 }),
         )
         .task(
-            TaskDefinition::interval(HEARTBEAT_TASK, config.heartbeat_interval())
+            TaskDefinition::interval(HEARTBEAT_TASK, DEFAULT_HEARTBEAT_INTERVAL)
                 .category(TaskCategory::EngineSystem)
                 .ephemeral()
                 .run(move |_ctx: TaskContext| {
@@ -69,7 +74,7 @@ pub(crate) fn register(
                     async move {
                         let current = *state.borrow();
                         tracing::debug!(
-                            job = "heartbeat",
+                            task = "heartbeat",
                             state = current.as_str(),
                             uptime_secs = started.elapsed().as_secs(),
                             "engine alive"
@@ -119,7 +124,9 @@ pub(crate) fn register(
 
     // Under a systemd watchdog (WatchdogSec= in the unit), ping WATCHDOG=1
     // at half the configured interval so a hung engine — not just a dead
-    // one — gets detected and restarted. No-op everywhere else.
+    // one — gets detected and restarted. No-op everywhere else. The
+    // period follows the systemd contract at every boot, so it is pinned:
+    // never captured in the registry, never operator-tunable.
     let Some(interval) = crate::notify::watchdog_interval() else {
         return builder;
     };
@@ -133,6 +140,7 @@ pub(crate) fn register(
         TaskDefinition::interval(SD_WATCHDOG_TASK, period)
             .category(TaskCategory::EngineSystem)
             .ephemeral()
+            .pinned()
             .run(|_ctx: TaskContext| async {
                 crate::notify::notify_watchdog();
                 TaskOutcome::Done
@@ -144,7 +152,7 @@ pub(crate) fn register(
 /// runtime thread. Outcomes are logged here; the returned result feeds the
 /// durable task record. Failures are retried at the next periodic tick and
 /// must not take the daemon down.
-fn run_maintenance_job(engine: &SqliteStorageEngine) -> Result<(), String> {
+fn run_maintenance(engine: &SqliteStorageEngine) -> Result<(), String> {
     let started = Instant::now();
     match engine.run_maintenance() {
         Ok(stats) => {

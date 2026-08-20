@@ -2,7 +2,7 @@
 
 Valqeron: securities reference-data system in Rust. `valqeron-engine` is a daemon that exclusively owns a SQLite database and serves gRPC over a Unix domain socket; the CLI (`valqeron`, alias `vq`) is a pure client with no database code.
 
-Engineering docs are an mdBook under `docs/` (`just docs-serve`). The Background Tasks book (`docs/src/tasks/`) is authoritative for the engine's task framework — read `adding-a-task.md` before adding a background job.
+Engineering docs are an mdBook under `docs/` (`just docs-serve`). The Background Tasks book (`docs/src/tasks/`) is authoritative for the engine's task scheduler — read `adding-a-task.md` before adding a background task.
 
 ## Commands (Justfile)
 
@@ -26,7 +26,7 @@ Workspace denies (not warns): `unwrap_used`, `expect_used`, `panic`, `todo`, `un
 - All engine storage calls go through `AsyncStorage::read`/`write` (`crates/engine/src/storage.rs`): the **whole** domain operation in one `spawn_blocking` closure, lane-bounded (read permits mirror the reader pool, 1 write permit mirrors the single writer). Never call SQLite/reader-pool code directly from an async task.
 - Every mutating RPC supports `dry_run` (savepoint that always rolls back); handlers pass the flag to `AsyncStorage::write`, which routes the same closure through `StorageEngine::dry_run`. Nesting `dry_run` self-deadlocks — closures receive `&Repositories`, never the engine, precisely so handlers cannot do this.
 - Errors travel as plain gRPC statuses (tonic code + message) — no structured detail payload. Bump `PROTOCOL_VERSION` in `valqeron-proto` on breaking `.proto` changes.
-- Background tasks: `crate::tasks` is the feature's only door (`BackgroundTasks` + `TaskDefinition` builders + `TaskHandler`; the `trigger/` module is private — never import past the façade). One module per job in `crates/engine/src/jobs/` exporting `register(builder, ...)`, composed in `engine.rs`; task `kind` strings are persisted primary keys — renaming one retires the old row. Full checklist: `docs/src/tasks/adding-a-task.md`.
+- Background tasks: `crate::scheduler` is the feature's only door (`Scheduler` + `TaskDefinition` builders + `TaskHandler`; the `trigger/` module is private — never import past the façade). One module per task in `crates/engine/src/tasks/` exporting `register(builder, ...)`, composed in `engine.rs`; task `kind` strings are persisted primary keys — renaming one retires the old row. Every task registers unconditionally: enablement (`enabled`) and tunable settings live on `task_registry` (boot-preserved; code declares only defaults) — never behind env vars. While the engine runs, `enabled` is engine-owned memory (`Scheduler::set_enabled`: commit, then publish); raw-SQL edits are stopped-engine only. Full checklist: `docs/src/tasks/adding-a-task.md`.
 
 ## Codegen & migrations (committed artifacts)
 
@@ -43,7 +43,7 @@ Workspace denies (not warns): `unwrap_used`, `expect_used`, `panic`, `todo`, `un
 
 - `just engine-install` / `engine-uninstall` manage a launchd/systemd **user** service. The service definitions under `scripts/install/` are machine-local (gitignored), created once from the committed `.example` files — absolute paths only, launchd expands nothing. The recipe validates that the definition's binary path exists and is executable before touching the running service.
 - Exactly one engine may run per database: the loser of the lock exits with code 3 (`ALREADY_RUNNING`; 1 = runtime failure, 2 = config). A manually launched engine (e.g. `cargo run -p valqeron-engine`) will block a service-managed one and vice versa.
-- Engine config is env-only (`VALQERON_DB`, `VALQERON_ENGINE_LOG_FILE`, `VALQERON_ENGINE_SYNC_CVM*`, ... — see `pub const *_ENV` in `crates/engine/src/engine.rs`); defaults come from `ProjectDirs("io","valqeron","valqeron")`. Structured JSON logs go to `engine.log` in that data dir.
+- Engine config is env-only (`VALQERON_DB`, `VALQERON_ENGINE_LOG_FILE`, `VALQERON_ENGINE_LOG_LEVEL`, `VALQERON_ENGINE_DURABLE` — see `pub const *_ENV` in `crates/engine/src/engine.rs`); defaults come from `ProjectDirs("io","valqeron","valqeron")`. Structured JSON logs go to `engine.log` in that data dir. Background-task enablement/scheduling is **not** env config — it lives in the `task_registry` table.
 
 ## Conventions
 

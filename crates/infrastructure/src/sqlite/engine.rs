@@ -8,7 +8,7 @@ use crate::sqlite::security::SqliteSecurityRepository;
 use crate::sqlite::sync_cursor::SqliteSyncCursorRepository;
 use crate::sqlite::task::SqliteBackgroundTaskRepository;
 use crate::sqlite::task_execution::SqliteTaskExecutionRepository;
-use crate::sqlite::task_registration::SqliteTaskRegistrationRepository;
+use crate::sqlite::task_registry::SqliteTaskRegistryRepository;
 use crate::sqlite::task_stat::SqliteTaskStatRepository;
 
 pub struct SqliteStorageEngine {
@@ -46,7 +46,7 @@ impl StorageEngine for SqliteStorageEngine {
     type Executions = SqliteTaskExecutionRepository;
     type Stats = SqliteTaskStatRepository;
     type Cursors = SqliteSyncCursorRepository;
-    type Registry = SqliteTaskRegistrationRepository;
+    type Registry = SqliteTaskRegistryRepository;
 
     fn repositories(&self) -> Repositories<Self> {
         Repositories {
@@ -56,7 +56,7 @@ impl StorageEngine for SqliteStorageEngine {
             executions: SqliteTaskExecutionRepository::new(self.db.handle()),
             stats: SqliteTaskStatRepository::new(self.db.handle()),
             cursors: SqliteSyncCursorRepository::new(self.db.handle()),
-            registry: SqliteTaskRegistrationRepository::new(self.db.handle()),
+            registry: SqliteTaskRegistryRepository::new(self.db.handle()),
         }
     }
 
@@ -72,7 +72,7 @@ impl StorageEngine for SqliteStorageEngine {
                 executions: SqliteTaskExecutionRepository::new(handle.clone()),
                 stats: SqliteTaskStatRepository::new(handle.clone()),
                 cursors: SqliteSyncCursorRepository::new(handle.clone()),
-                registry: SqliteTaskRegistrationRepository::new(handle.clone()),
+                registry: SqliteTaskRegistryRepository::new(handle.clone()),
             };
             f(&repositories)
         })

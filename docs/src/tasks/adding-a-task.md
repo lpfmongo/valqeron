@@ -5,7 +5,7 @@ The whole procedure, for each trigger.
 ## The contract
 
 Two things define a task: **how it runs** — the `TaskHandler` trait — and **what/when it runs** — a `TaskDefinition`
-built by one typed builder per trigger. Both live behind `crate::tasks`; that import path is the entire surface.
+built by one typed builder per trigger. Both live behind `crate::scheduler`; that import path is the entire surface.
 
 ```rust,ignore
 // How it runs. Closures implement this automatically (blanket impl);
@@ -37,16 +37,18 @@ pub(crate) enum TaskOutcome {
 The trigger parses the row's payload **once** and hands over typed values — handlers never touch raw payloads. How each
 trigger interprets the outcome is in [Triggers § one outcome vocabulary](./triggers.md#choosing-one).
 
-Builders carry the framework defaults, so a job states only what makes it different:
+Builders carry the framework defaults, so a task states only what makes it different:
 
 | Builder | Defaults | Overrides |
 |---|---|---|
-| `TaskDefinition::interval(kind, period)` | durable, ±10% jitter, log `ALL`, category `Other` | `.ephemeral()` (inline, no jitter, `FAILURES_ONLY`), `.no_jitter()`, `.log_all()`, `.log_failures_only()`, `.category(..)` |
+| `TaskDefinition::interval(kind, period)` | durable, ±10% jitter, log `ALL`, category `Other` | `.ephemeral()` (inline, no jitter, `FAILURES_ONLY`), `.no_jitter()`, `.pinned()` (period stays code-owned), `.log_all()`, `.log_failures_only()`, `.category(..)` |
 | `TaskDefinition::recurring(kind, schedule)` | no retries (the next occurrence is the retry), log `ALL` | `.retry(..)`, `.log_failures_only()`, `.category(..)` |
 | `TaskDefinition::sync(kind, source, schedule)` | retry 3×300s, cooldown 300s, backfill cap 90d, category `FinanceDataSync` | `.retry(..)`, `.cooldown_secs(..)`, `.max_backfill_days(..)`, `.category(..)` |
 
-Every builder has two terminals: `.run(handler)` yields the `TaskDefinition`, and `.disabled()` yields the catalog
-declaration for a task configured off this boot — same source of truth, no hand-rolled declarations.
+`.run(handler)` yields the `TaskDefinition`. What you pass the builder are **code defaults**: the boot reconcile seeds
+them into the registry row once, and from then on the row (operator-editable, boot-preserved) is what actually
+schedules the task — including whether it runs at all (`enabled`). There is no env-var or code path for turning a
+task off; every task the code ships registers at every boot.
 
 ## The shape
 
@@ -54,20 +56,17 @@ Every task module exports one `register` function that takes the builder and ret
 which does nothing else:
 
 ```rust,ignore
-// crates/engine/src/jobs/<name>.rs
-pub(crate) fn register(
-    builder: BackgroundTasksBuilder,
-    config: &EngineConfig,
-) -> BackgroundTasksBuilder {
+// crates/engine/src/tasks/<name>.rs
+pub(crate) fn register(builder: SchedulerBuilder) -> SchedulerBuilder {
     builder.task(TaskDefinition::…(..).run(handler))
 }
 
 // crates/engine/src/engine.rs
-fn background_tasks(..) -> BackgroundTasksBuilder {
-    let builder = BackgroundTasks::builder();
-    let builder = crate::jobs::system::register(builder, config, started, state);
-    let builder = crate::jobs::cvm::register(builder, config);
-    crate::jobs::my_task::register(builder, config)   // ← your line
+fn scheduler(..) -> SchedulerBuilder {
+    let builder = Scheduler::builder();
+    let builder = crate::tasks::system::register(builder, started, state);
+    let builder = crate::tasks::cvm::register(builder);
+    crate::tasks::my_task::register(builder)   // ← your line
 }
 ```
 
@@ -77,31 +76,33 @@ Checklist:
 2. Pick a **category** — `EngineSystem`, `FinanceDataSync`, or `Other`.
 3. Choose a **kind**: `snake_case`, stable, ≤100 chars. It is a primary key and a log field; renaming it retires the
    old row.
-4. Write the module in `crates/engine/src/jobs/`.
-5. Add the `mod` declaration in `jobs/mod.rs`.
+4. Write the module in `crates/engine/src/tasks/`, with its scheduling defaults as in-module constants.
+5. Add the `mod` declaration in `tasks/mod.rs`.
 6. Add one composition line in `engine.rs`.
-7. If configurable, add env parsing to `EngineConfig` and document the variables in `scripts/install/*.example`.
-8. Write tests.
+7. Write tests.
 
-Nothing else changes. The catalog row appears at the next boot; status, pause/resume, worker stop/start, and log
-filtering come for free.
+Nothing else changes. The catalog row appears at the next boot with your defaults seeded into its settings columns;
+status, enable/disable, operator tuning, worker stop/start, and log filtering come for free.
 
 ## Example 1 — interval (ephemeral)
 
 A liveness probe that should never persist rows:
 
 ```rust,ignore
-// crates/engine/src/jobs/probe.rs
+// crates/engine/src/tasks/probe.rs
 use std::time::Duration;
 use valqeron_core::TaskCategory;
 
-use crate::tasks::{BackgroundTasksBuilder, TaskContext, TaskDefinition, TaskOutcome};
+use crate::scheduler::{SchedulerBuilder, TaskContext, TaskDefinition, TaskOutcome};
 
 pub(crate) const PROBE_TASK: &str = "upstream_probe";
 
-pub(crate) fn register(builder: BackgroundTasksBuilder) -> BackgroundTasksBuilder {
+/// Code default; the registry's `period_secs` is the effective value.
+const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+pub(crate) fn register(builder: SchedulerBuilder) -> SchedulerBuilder {
     builder.task(
-        TaskDefinition::interval(PROBE_TASK, Duration::from_secs(60))
+        TaskDefinition::interval(PROBE_TASK, DEFAULT_PROBE_INTERVAL)
             .category(TaskCategory::EngineSystem)
             .ephemeral()
             .run(|_ctx: TaskContext| async {
@@ -122,15 +123,15 @@ pub(crate) fn register(builder: BackgroundTasksBuilder) -> BackgroundTasksBuilde
 A weekly report every Monday at 06:00 UTC, with history:
 
 ```rust,ignore
-// crates/engine/src/jobs/report.rs
+// crates/engine/src/tasks/report.rs
 use chrono::{NaiveTime, Weekday};
 use valqeron_core::{MarketCalendar, Recurrence, Schedule, TaskCategory};
 
-use crate::tasks::{BackgroundTasksBuilder, RetryPolicy, TaskContext, TaskDefinition, TaskOutcome};
+use crate::scheduler::{RetryPolicy, SchedulerBuilder, TaskContext, TaskDefinition, TaskOutcome};
 
 pub(crate) const REPORT_TASK: &str = "weekly_report";
 
-pub(crate) fn register(builder: BackgroundTasksBuilder) -> BackgroundTasksBuilder {
+pub(crate) fn register(builder: SchedulerBuilder) -> SchedulerBuilder {
     let at = NaiveTime::from_hms_opt(6, 0, 0).unwrap_or_default();
     builder.task(
         TaskDefinition::recurring(
@@ -151,21 +152,21 @@ pub(crate) fn register(builder: BackgroundTasksBuilder) -> BackgroundTasksBuilde
 }
 ```
 
-Catalog descriptor: `recurring:weekly:mon@06:00+00:00`.
+Catalog descriptor: `recurring:weekly:mon@06:00+00:00`. An operator who tunes `at_local`/`recurrence` on the row
+changes the effective schedule at the next boot — the code's 06:00 Monday stays the default for fresh databases.
 
 ## Example 3 — sync source, with a struct handler
 
 A second data source, inheriting catch-up, cooldowns, and halt semantics. Real ingestion carries state (a client, a
-parser), so the handler is a struct — and the env-disabled path reuses the same builder via `.disabled()`:
+parser), so the handler is a struct:
 
 ```rust,ignore
-// crates/engine/src/jobs/anbima.rs
+// crates/engine/src/tasks/anbima.rs
 use chrono::{NaiveTime, Weekday};
 use valqeron_core::{MarketCalendar, Recurrence, Schedule, SyncSource};
 
-use crate::engine::EngineConfig;
-use crate::tasks::{
-    BackgroundTasksBuilder, BoxFuture, RunWindow, TaskContext, TaskDefinition, TaskHandler,
+use crate::scheduler::{
+    BoxFuture, RunWindow, SchedulerBuilder, TaskContext, TaskDefinition, TaskHandler,
     TaskOutcome,
 };
 
@@ -193,32 +194,26 @@ impl TaskHandler for AnbimaSync {
     }
 }
 
-pub(crate) fn register(
-    builder: BackgroundTasksBuilder,
-    config: &EngineConfig,
-) -> BackgroundTasksBuilder {
+pub(crate) fn register(builder: SchedulerBuilder) -> SchedulerBuilder {
     let Ok(source) = SyncSource::new(ANBIMA_SOURCE) else {
         tracing::error!(source = ANBIMA_SOURCE, "invalid sync source name");
         return builder;
     };
     let at = NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default();
-    let definition = TaskDefinition::sync(
-        ANBIMA_SYNC_TASK,
-        source,
-        Schedule::new(MarketCalendar::B3, at, Recurrence::Weekly { on: Weekday::Mon }),
-    );
-
-    match config.anbima_sync() {
-        // Configured off: cataloged as `disabled`, cursor and stats intact.
-        None => builder.declare(definition.disabled()),
-        Some(settings) => builder.task(
-            definition
-                .cooldown_secs(settings.cooldown_secs)
-                .run(AnbimaSync { client: IngestClient::new(settings) }),
-        ),
-    }
+    builder.task(
+        TaskDefinition::sync(
+            ANBIMA_SYNC_TASK,
+            source,
+            Schedule::new(MarketCalendar::B3, at, Recurrence::Weekly { on: Weekday::Mon }),
+        )
+        .run(AnbimaSync { client: IngestClient::new() }),
+    )
 }
 ```
+
+There is no disabled-registration path to write: the source always registers, and turning it off is an operator
+action on the row (`UPDATE task_registry SET enabled = 0 WHERE kind = 'anbima_weekly_sync';`) — cursor, stats, and
+history stay intact either way.
 
 Because the recurrence is weekly, each run's `target` spans the whole preceding business week — the framework computes
 that; the handler just honours it.
@@ -263,23 +258,24 @@ When a task needs its own storage, it owns the whole vertical slice — but the 
 and `Repositories` is compile-time typed:
 
 ```text
-migrations/00N_anbima_schema.sql          ← new migration file
+migrations/002_anbima_schema.sql          ← new migration file (next array slot)
 crates/infrastructure/src/sqlite/anbima/  ← adapter (model/queries/repository)
 crates/core/src/anbima.rs                 ← entity + repository port
 crates/core/src/storage.rs                ← Repositories.anbima + StorageEngine::Anbima
-crates/engine/src/jobs/anbima.rs          ← the ONLY place that references it
+crates/engine/src/tasks/anbima.rs         ← the ONLY place that references it
 ```
 
 - Append the migration to `MIGRATIONS` in `crates/infrastructure/src/sqlite/migrations.rs`. **The array index is the
   schema version** — append only, never reorder.
-- Reference the repository exclusively from the task's own `jobs/` module. Neither the runtime nor any trigger may
+- Reference the repository exclusively from the task's own `tasks/` module. Neither the runtime nor any trigger may
   know it exists.
 - Because everything shares one SQLite file, the handler can write its data and advance its own state in a single
   transaction.
 
 ## Testing
 
-Follow the existing patterns in `crates/engine/src/tasks/mod.rs` and `crates/engine/src/tasks/trigger/sync.rs`:
+Follow the existing patterns in `crates/engine/src/scheduler/mod.rs` and
+`crates/engine/src/scheduler/trigger/sync.rs`:
 
 ```rust,ignore
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -288,7 +284,7 @@ async fn my_task_runs_and_records() {
     let runs = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&runs);
 
-    let manager = BackgroundTasks::builder()
+    let manager = Scheduler::builder()
         .task(my_definition().run(move |_ctx: TaskContext| {
             let counter = Arc::clone(&counter);
             async move {
@@ -311,8 +307,10 @@ async fn my_task_runs_and_records() {
 Useful helpers already available in those modules: `storage()`, `wait_until()`, `seed_task()`, `registration_row()`,
 `execution_row()`, `stats_row()`, `queued_tasks()`, and for sync — `seed_cursor()`, `get_cursor()`,
 `occurrence_back()`, `recording_handler()`. Tests use real file-backed SQLite (never in-memory) so WAL behaviour
-matches production. `manager.kick(kind)` wakes a seeder immediately instead of waiting for its 60-second tick;
-`manager.stop/start(kind)` exercise the per-task worker handles.
+matches production. `manager.kick(kind)` wakes a seeder ahead of its fallback sleep; `manager.stop/start(kind)`
+exercise the per-task worker handles; `manager.set_enabled(kind, …)` is the committed enable/disable path. Tests that
+insert queue rows directly (bypassing the seeders' dispatcher notifications) shrink the fallback sweep with
+`Scheduler::builder().dispatch_max_sleep(…)`.
 
 ## Rules and common mistakes
 

@@ -609,21 +609,13 @@ mod db_tests {
         let _db2 = Database::open(&path).unwrap();
     }
 
+    /// The consolidated initial migration creates the final schema
+    /// directly: all six tables, with task_registry already in its
+    /// enabled-plus-settings shape.
     #[test]
-    fn v3_database_upgrades_to_latest_with_the_new_engine_tables() {
+    fn initial_migration_creates_the_full_schema() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("upgrade.db");
-
-        // Build a genuine v3 database: apply the first three migrations by
-        // hand and stamp the version, exactly as an engine at v3 left it.
-        {
-            let conn = Connection::open(&path).unwrap();
-            for sql in MIGRATIONS.iter().take(3) {
-                conn.execute_batch(sql).unwrap();
-            }
-            conn.pragma_update(None, "user_version", 3).unwrap();
-        }
-
+        let path = dir.path().join("fresh.db");
         let mut conn = Connection::open(&path).unwrap();
         migrations::run(&mut conn).unwrap();
 
@@ -631,7 +623,10 @@ mod db_tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+
         for table in [
+            "issuer",
+            "security",
             "sync_cursor",
             "task_registry",
             "task_queue",
@@ -645,138 +640,15 @@ mod db_tests {
                 .unwrap();
             assert_eq!(rows, 0, "{table} exists and is empty");
         }
-        for dropped in ["background_task", "task_registration"] {
-            let exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    [dropped],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(exists, 0, "{dropped} was dropped by migration 006");
-        }
-    }
 
-    /// A v5 database with live queue rows, terminal history, and catalog
-    /// summaries must carry everything into the reorganized tables.
-    #[test]
-    fn v5_task_data_is_carried_into_the_reorganized_tables() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("carryover.db");
-
-        {
-            let conn = Connection::open(&path).unwrap();
-            for sql in MIGRATIONS.iter().take(5) {
-                conn.execute_batch(sql).unwrap();
-            }
-            conn.pragma_update(None, "user_version", 5).unwrap();
-
-            conn.execute_batch(
-                "INSERT INTO background_task
-                     (id, kind, status, payload, scheduled_at, started_at, finished_at,
-                      attempts, max_attempts, retry_delay_secs, last_error, created_at,
-                      updated_at, version)
-                 VALUES
-                     (x'01', 'pending_kind', 'PENDING', NULL,
-                      '2026-08-14T10:00:00.000Z', NULL, NULL,
-                      0, 3, 300, NULL,
-                      '2026-08-14T09:00:00.000Z', '2026-08-14T09:00:00.000Z', 1),
-                     (x'02', 'done_kind', 'SUCCEEDED', 'p',
-                      '2026-08-14T10:00:00.000Z', '2026-08-14T10:00:01.000Z',
-                      '2026-08-14T10:00:03.000Z',
-                      1, 3, 300, NULL,
-                      '2026-08-14T09:00:00.000Z', '2026-08-14T10:00:03.000Z', 3),
-                     (x'03', 'failed_kind', 'FAILED', NULL,
-                      '2026-08-14T10:00:00.000Z', '2026-08-14T10:00:01.000Z', NULL,
-                      3, 3, 300, 'boom',
-                      '2026-08-14T09:00:00.000Z', '2026-08-14T10:00:09.000Z', 7);
-
-                 INSERT INTO task_registration
-                     (kind, category, tier, tracking, schedule, source, log_policy,
-                      config_enabled, paused, registered,
-                      last_run_at, last_outcome, last_error, total_runs, total_failures,
-                      first_registered_at, updated_at)
-                 VALUES
-                     ('done_kind', 'ENGINE_SYSTEM', 'INTERVAL', 'DURABLE', 'interval:1s',
-                      NULL, 'ALL', 1, 1, 1,
-                      '2026-08-14T10:00:03.000Z', 'SUCCEEDED', NULL, 41, 2,
-                      '2026-08-01T00:00:00.000Z', '2026-08-14T10:00:03.000Z'),
-                     ('never_ran', 'OTHER', 'RECURRING', 'DURABLE', 'recurring:daily@03:00+00:00',
-                      NULL, 'ALL', 1, 0, 1,
-                      NULL, NULL, NULL, 0, 0,
-                      '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z');",
-            )
-            .unwrap();
-        }
-
-        let mut conn = Connection::open(&path).unwrap();
-        migrations::run(&mut conn).unwrap();
-
-        // Queue: only the live row crossed over.
-        let (queue_rows, queue_kind): (i64, String) = conn
-            .query_row("SELECT COUNT(*), MAX(kind) FROM task_queue", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .unwrap();
-        assert_eq!((queue_rows, queue_kind.as_str()), (1, "pending_kind"));
-
-        // History: terminal rows became executions, outcome = old status,
-        // duration derived from the timestamps when both exist.
-        let (done_outcome, done_duration): (String, Option<i64>) = conn
-            .query_row(
-                "SELECT outcome, duration_ms FROM task_execution WHERE kind = 'done_kind'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(done_outcome, "SUCCEEDED");
-        assert_eq!(done_duration, Some(2000));
-        let (failed_finished, failed_duration): (String, Option<i64>) = conn
-            .query_row(
-                "SELECT finished_at, duration_ms FROM task_execution WHERE kind = 'failed_kind'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            failed_finished, "2026-08-14T10:00:09.000Z",
-            "NULL finished_at falls back to updated_at"
-        );
-        assert_eq!(failed_duration, None, "no duration without both timestamps");
-
-        // Catalog: declaration + intent carried, summary columns gone.
-        let paused: i64 = conn
-            .query_row(
-                "SELECT paused FROM task_registry WHERE kind = 'done_kind'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(paused, 1, "operator intent carried over");
-
-        // Stats: summaries moved; kinds that never ran get no row.
-        let (runs, failures, last_success): (i64, i64, Option<String>) = conn
-            .query_row(
-                "SELECT total_runs, total_failures, last_success_at
-                 FROM task_stat WHERE kind = 'done_kind'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!((runs, failures), (41, 2));
-        assert_eq!(
-            last_success.as_deref(),
-            Some("2026-08-14T10:00:03.000Z"),
-            "a SUCCEEDED last outcome seeds last_success_at"
-        );
-        let never_ran: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM task_stat WHERE kind = 'never_ran'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(never_ran, 0, "kinds that never ran get no stats row");
+        // The catalog carries the operator flag and the settings columns
+        // (preparing the SELECT fails if any column is missing).
+        conn.prepare(
+            "SELECT enabled, period_secs, at_local, recurrence, cooldown_secs,
+                    max_backfill_days
+             FROM task_registry",
+        )
+        .unwrap();
     }
 
     #[test]

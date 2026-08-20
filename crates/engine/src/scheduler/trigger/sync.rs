@@ -25,11 +25,11 @@ use valqeron_core::{
 };
 use valqeron_infrastructure::SqliteStorageEngine;
 
-use crate::storage::AsyncStorage;
-use crate::tasks::trigger::{
-    BoxFuture, Interpretation, RECONCILE_INTERVAL, RetryPolicy, RunWindow, SeedPass, TaskFailure,
-    TaskOutcome, TickMode, Trigger,
+use crate::scheduler::trigger::{
+    BoxFuture, Interpretation, RetryPolicy, RunWindow, SEED_FALLBACK_INTERVAL, SeedPass,
+    TaskFailure, TaskOutcome, TickMode, Trigger,
 };
+use crate::storage::AsyncStorage;
 
 /// Consecutive terminal failures after which the halt log escalates from
 /// `warn` to `error` — also the status read model's `halted` threshold.
@@ -93,7 +93,7 @@ fn fault(message: String) -> StorageError {
 impl Trigger for SyncTrigger {
     fn cadence(&self) -> (tokio::time::Instant, Duration) {
         // First pass immediately: a catch-up must not wait for the tick.
-        (tokio::time::Instant::now(), RECONCILE_INTERVAL)
+        (tokio::time::Instant::now(), SEED_FALLBACK_INTERVAL)
     }
 
     fn mode(&self) -> TickMode {
@@ -112,13 +112,13 @@ impl Trigger for SyncTrigger {
         let kind = TaskKind::new(self.kind).map_err(|e| fault(e.to_string()))?;
         if repos.tasks.exists_active(&kind)? {
             tracing::debug!(source, "sync run already active; nothing to seed");
-            return Ok(SeedPass::Idle);
+            return Ok(SeedPass::Idle { next_pass_at: None });
         }
 
         let calendar = self.schedule.calendar();
         let Some(today) = calendar.local_date(now) else {
             tracing::error!(source, "calendar produced no local date; misconfigured");
-            return Ok(SeedPass::Idle);
+            return Ok(SeedPass::Idle { next_pass_at: None });
         };
 
         // Resolve the cursor: existing, clamped when too stale, or cold
@@ -129,7 +129,7 @@ impl Trigger for SyncTrigger {
                 if pending > self.max_backfill_days {
                     let Some(reseeded) = self.cold_start_cursor(now) else {
                         tracing::error!(source, "schedule produced no occurrence; misconfigured");
-                        return Ok(SeedPass::Idle);
+                        return Ok(SeedPass::Idle { next_pass_at: None });
                     };
                     let skipped = calendar.business_days_between(
                         existing.through_target(),
@@ -143,7 +143,7 @@ impl Trigger for SyncTrigger {
             None => {
                 let Some(seeded) = self.cold_start_cursor(now) else {
                     tracing::error!(source, "schedule produced no occurrence; misconfigured");
-                    return Ok(SeedPass::Idle);
+                    return Ok(SeedPass::Idle { next_pass_at: None });
                 };
                 (seeded, true, None)
             }
@@ -156,12 +156,16 @@ impl Trigger for SyncTrigger {
                 consecutive_failures = cursor.consecutive_failures(),
                 "sync source cooling down; nothing seeded"
             );
-            return Ok(SeedPass::Idle);
+            // The cooldown expiry is a pure clock edge: hand it to the
+            // seeder so the retry sleeps exactly until then.
+            return Ok(SeedPass::Idle {
+                next_pass_at: cursor.cooldown_until(),
+            });
         }
 
         let Some(slot) = self.schedule.next_occurrence_after(cursor.through_slot()) else {
             tracing::error!(source, "schedule produced no occurrence; misconfigured");
-            return Ok(SeedPass::Idle);
+            return Ok(SeedPass::Idle { next_pass_at: None });
         };
         let Some(target) = self.schedule.target_period(cursor.through_target(), slot) else {
             // Everything up to `slot` is already covered — advance the slot
@@ -175,7 +179,10 @@ impl Trigger for SyncTrigger {
                 slot = %slot.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "slot had an empty target period; advanced past it without a run"
             );
-            return Ok(SeedPass::Idle);
+            // Re-pass immediately: the next slot may be seedable right now.
+            return Ok(SeedPass::Idle {
+                next_pass_at: Some(now),
+            });
         };
 
         if is_reseed {
@@ -452,13 +459,13 @@ mod tests {
 #[cfg(test)]
 mod manager_tests {
     use super::*;
-    use crate::tasks::{BackgroundTasks, SyncTaskBuilder, TaskContext, TaskDefinition};
+    use crate::scheduler::{Scheduler, SyncTaskBuilder, TaskContext, TaskDefinition};
     use chrono::NaiveTime;
     use std::sync::{Arc, Mutex};
     use valqeron_core::{
         ExecutionOutcome, LogPolicy, MarketCalendar, Recurrence, SyncOutcomeKind, TaskCategory,
-        TaskExecution, TaskExecutionRepository, TaskRegistrationRepository, TaskStatus,
-        TaskTracking, Versioned,
+        TaskExecution, TaskExecutionRepository, TaskRegistryRepository, TaskStatus, TaskTracking,
+        Versioned,
     };
     use valqeron_infrastructure::DatabaseConfig;
 
@@ -568,13 +575,13 @@ mod manager_tests {
     ) -> (
         Recorded,
         impl Fn(
-            crate::tasks::trigger::TaskContext,
+            crate::scheduler::trigger::TaskContext,
         ) -> std::pin::Pin<Box<dyn Future<Output = TaskOutcome> + Send>>
         + Clone,
     ) {
         let runs: Recorded = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&runs);
-        let handler = move |ctx: crate::tasks::trigger::TaskContext| -> std::pin::Pin<Box<dyn Future<Output = TaskOutcome> + Send>> {
+        let handler = move |ctx: crate::scheduler::trigger::TaskContext| -> std::pin::Pin<Box<dyn Future<Output = TaskOutcome> + Send>> {
             let sink = Arc::clone(&sink);
             let outcome = outcome.clone();
             Box::pin(async move {
@@ -585,6 +592,69 @@ mod manager_tests {
             })
         };
         (runs, handler)
+    }
+
+    /// The daily contract: at most one *successful* run per business day.
+    /// A success advances the cursor past today's slot, and the next seed
+    /// arms strictly the next business-day occurrence as a future row —
+    /// the same day can never run twice successfully.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_run_arms_the_next_business_day_not_today() {
+        let (_dir, storage) = storage();
+        let schedule = daily_b3();
+        let now = Utc::now();
+
+        // Exactly one period pending: the latest occurrence.
+        let latest = occurrence_back(&schedule, now, 0);
+        seed_cursor(
+            &storage,
+            "cvm",
+            &schedule,
+            occurrence_back(&schedule, now, 1),
+        )
+        .await;
+
+        let (runs, handler) = recording_handler(TaskOutcome::Done);
+        let manager = Scheduler::builder()
+            .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
+            .start(storage.clone())
+            .await;
+
+        // The pending period runs once and the cursor settles on `latest`;
+        // then the post-completion wake arms the future alarm.
+        let probe_storage = storage.clone();
+        wait_until(15, async || {
+            get_cursor(&probe_storage, "cvm")
+                .await
+                .is_some_and(|c| c.through_slot() == latest)
+        })
+        .await;
+        let probe_storage = storage.clone();
+        wait_until(15, async || {
+            queued_rows(&probe_storage).await.iter().any(|t| {
+                t.data.status() == TaskStatus::Pending && t.data.scheduled_at() > Utc::now()
+            })
+        })
+        .await;
+        assert!(manager.drain(Duration::from_secs(3)).await);
+
+        assert_eq!(
+            runs.lock().expect("lock").len(),
+            1,
+            "one success for the one pending period"
+        );
+
+        // The armed row is tomorrow's occurrence — strictly future,
+        // strictly after today's slot.
+        let rows = queued_rows(&storage).await;
+        assert_eq!(rows.len(), 1, "exactly one armed row: {rows:?}");
+        let armed_at = rows[0].data.scheduled_at();
+        assert!(armed_at > now, "the alarm is in the future");
+        assert_eq!(
+            Some(armed_at),
+            schedule.next_occurrence_after(latest),
+            "armed strictly after the synced slot: the next business day"
+        );
     }
 
     // ================ THE HEADLINE: SEQUENTIAL BACKFILL ================
@@ -601,7 +671,7 @@ mod manager_tests {
         seed_cursor(&storage, "cvm", &schedule, seed_slot).await;
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
@@ -613,6 +683,15 @@ mod manager_tests {
             get_cursor(&probe_storage, "cvm")
                 .await
                 .is_some_and(|c| c.through_slot() == latest)
+        })
+        .await;
+        // The future alarm is armed by the post-completion wake; wait for
+        // it before draining, or the drain races the seed pass.
+        let probe_storage = storage.clone();
+        wait_until(20, async || {
+            queued_rows(&probe_storage).await.iter().any(|t| {
+                t.data.status() == TaskStatus::Pending && t.data.scheduled_at() > Utc::now()
+            })
         })
         .await;
         assert!(manager.drain(Duration::from_secs(3)).await);
@@ -680,7 +759,7 @@ mod manager_tests {
         let (runs, handler) = recording_handler(TaskOutcome::NotReady {
             retry_after_secs: 3600,
         });
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
@@ -726,7 +805,7 @@ mod manager_tests {
         let (runs, handler) = recording_handler(TaskOutcome::Failed("cvm exploded".into()));
         // Cooldown base 3600s: after the first terminal failure nothing
         // more may be seeded within this test's lifetime.
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("cvm", "test_cvm_sync", 3600).run(handler))
             .start(storage.clone())
             .await;
@@ -767,7 +846,7 @@ mod manager_tests {
         seed_cursor(&storage, "cvm", &schedule, seed_slot).await;
 
         let (runs, handler) = recording_handler(TaskOutcome::Failed("still broken".into()));
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("cvm", "test_cvm_sync", 0).run(handler))
             .start(storage.clone())
             .await;
@@ -803,7 +882,7 @@ mod manager_tests {
         let latest = occurrence_back(&schedule, now, 0);
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
@@ -839,7 +918,7 @@ mod manager_tests {
         seed_cursor(&storage, "cvm", &schedule, seed_slot).await;
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(
                 sync_task("cvm", "test_cvm_sync", 300)
                     .max_backfill_days(3) // 10 pending days > 3 → skip ahead.
@@ -876,7 +955,7 @@ mod manager_tests {
 
         let (a_runs, a_handler) = recording_handler(TaskOutcome::Done);
         let (b_runs, b_handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("alpha", "test_alpha_sync", 300).run(a_handler))
             .task(sync_task("beta", "test_beta_sync", 300).run(b_handler))
             .start(storage.clone())
@@ -922,7 +1001,7 @@ mod manager_tests {
         let (_dir, storage) = storage();
         let (runs, handler) = recording_handler(TaskOutcome::Done);
 
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(
                 TaskDefinition::interval("test_dup_kind", Duration::from_secs(600))
                     .category(TaskCategory::EngineSystem)
@@ -945,7 +1024,7 @@ mod manager_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn paused_source_resumes_with_sequential_catchup() {
+    async fn disabled_source_resumes_with_sequential_catchup() {
         let (_dir, storage) = storage();
         let schedule = daily_b3();
         let now = Utc::now();
@@ -953,10 +1032,10 @@ mod manager_tests {
         let latest = occurrence_back(&schedule, now, 0);
         seed_cursor(&storage, "cvm", &schedule, seed_slot).await;
 
-        // Pause before boot: catalog the kind so the flag has a row, then
+        // Disable before boot: catalog the kind so the flag has a row, then
         // flip it — the boot reconcile must preserve it.
         storage
-            .write("test.pause", false, move |repos| {
+            .write("test.disable", false, move |repos| {
                 let now = Utc::now();
                 let declaration = valqeron_core::TaskDeclaration {
                     kind: TaskKind::new("test_cvm_sync").unwrap(),
@@ -966,11 +1045,11 @@ mod manager_tests {
                     schedule: "sync:daily@07:00-03:00".into(),
                     source: Some(SyncSource::new("cvm").unwrap()),
                     log_policy: LogPolicy::All,
-                    config_enabled: true,
+                    settings: valqeron_core::TaskSettings::default(),
                 };
                 repos.registry.declare(&declaration, now)?;
                 let kind = TaskKind::new("test_cvm_sync").unwrap();
-                repos.registry.set_paused(&kind, true, now)?;
+                repos.registry.set_enabled(&kind, false, now)?;
                 Ok::<_, StorageError>(())
             })
             .await
@@ -978,27 +1057,18 @@ mod manager_tests {
             .unwrap();
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;
 
-        // Paused across boot: the stale cursor must NOT trigger catch-up.
+        // Disabled across boot: the stale cursor must NOT trigger catch-up.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(runs.lock().expect("lock").is_empty(), "paused: no runs");
-        assert!(queued_rows(&storage).await.is_empty(), "paused: no seeds");
+        assert!(runs.lock().expect("lock").is_empty(), "disabled: no runs");
+        assert!(queued_rows(&storage).await.is_empty(), "disabled: no seeds");
 
-        // Unpause and kick the seeder (production waits for the 60s tick).
-        storage
-            .write("test.unpause", false, move |repos| {
-                let kind = TaskKind::new("test_cvm_sync").unwrap();
-                repos.registry.set_paused(&kind, false, Utc::now())?;
-                Ok::<_, StorageError>(())
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        manager.kick("test_cvm_sync");
+        // Re-enable through the facade: committed, published, and woken.
+        assert!(manager.set_enabled("test_cvm_sync", true).await.unwrap());
 
         // Sequential catch-up of the three missed periods, then steady state.
         let probe_storage = storage.clone();
@@ -1068,7 +1138,7 @@ mod manager_tests {
             .expect("seed running row");
 
         let (runs, handler) = recording_handler(TaskOutcome::Done);
-        let manager = BackgroundTasks::builder()
+        let manager = Scheduler::builder()
             .task(sync_task("cvm", "test_cvm_sync", 300).run(handler))
             .start(storage.clone())
             .await;

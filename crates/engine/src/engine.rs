@@ -1,8 +1,7 @@
 use crate::grpc::{AdminGrpc, IssuerGrpc};
 use crate::lifecycle::{Lifecycle, LifecycleState};
+use crate::scheduler::{Scheduler, SchedulerBuilder};
 use crate::storage::AsyncStorage;
-use crate::tasks::{BackgroundTasks, BackgroundTasksBuilder};
-use chrono::{NaiveTime, Weekday};
 use directories::ProjectDirs;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
@@ -16,7 +15,6 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
-use valqeron_core::Recurrence;
 use valqeron_infrastructure::{DatabaseConfig, Synchronous};
 use valqeron_proto::v1::rpc_admin_service_server::RpcAdminServiceServer;
 use valqeron_proto::v1::rpc_issuer_service_server::RpcIssuerServiceServer;
@@ -75,17 +73,15 @@ impl EngineError {
 
 // ================ ENVIRONMENT VARIABLES ================
 
+// Task enablement and scheduling are deliberately *not* environment
+// configuration: every task registers at boot, and the `task_registry`
+// table (operator-editable, boot-preserved) owns `enabled` plus the
+// tunable settings.
+
 pub const DB_PATH_ENV: &str = "VALQERON_DB";
 pub const ENGINE_LOG_FILE_ENV: &str = "VALQERON_ENGINE_LOG_FILE";
 pub const ENGINE_LOG_LEVEL_ENV: &str = "VALQERON_ENGINE_LOG_LEVEL";
 pub const ENGINE_DURABLE_ENV: &str = "VALQERON_ENGINE_DURABLE";
-pub const ENGINE_MAINTENANCE_INTERVAL_ENV: &str = "VALQERON_ENGINE_MAINTENANCE_INTERVAL";
-pub const ENGINE_HEARTBEAT_INTERVAL_ENV: &str = "VALQERON_ENGINE_HEARTBEAT_INTERVAL";
-pub const ENGINE_SYNC_CVM_ENV: &str = "VALQERON_ENGINE_SYNC_CVM";
-pub const ENGINE_SYNC_CVM_AT_ENV: &str = "VALQERON_ENGINE_SYNC_CVM_AT";
-pub const ENGINE_SYNC_CVM_SCHEDULE_ENV: &str = "VALQERON_ENGINE_SYNC_CVM_SCHEDULE";
-pub const ENGINE_SYNC_CVM_COOLDOWN_ENV: &str = "VALQERON_ENGINE_SYNC_CVM_COOLDOWN";
-pub const ENGINE_SYNC_MAX_BACKFILL_DAYS_ENV: &str = "VALQERON_ENGINE_SYNC_MAX_BACKFILL_DAYS";
 
 // ================ DEFAULT VALUES ================
 pub const DEFAULT_VALQERON_QUALIFIER: &str = "io";
@@ -93,23 +89,14 @@ pub const DEFAULT_VALQERON_ORGANIZATION: &str = "valqeron";
 pub const DEFAULT_VALQERON_APP: &str = "valqeron";
 pub const DEFAULT_ENGINE_DB_NAME: &str = "valqeron.db";
 pub const DEFAULT_ENGINE_LOG_FILE_NAME: &str = "engine.log";
-pub const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 3600;
-pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 300;
-/// Default market-local time of day sync sources run at (`HH:MM`).
-pub const DEFAULT_SYNC_AT: (u32, u32) = (7, 0);
-/// Default base of the failure cooldown (doubles per consecutive terminal
-/// failure, capped at one hour by core).
-pub const DEFAULT_SYNC_COOLDOWN_SECS: u32 = 300;
-/// Default bound on unattended sequential catch-up, in business days.
-pub const DEFAULT_SYNC_MAX_BACKFILL_DAYS: u32 = 90;
 
 // ================ SIZING & TIMEOUTS ================
 
-/// How long the graceful shutdown waits for in-flight RPCs / jobs / storage.
+/// How long the graceful shutdown waits for in-flight RPCs / tasks / storage.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bound on draining the blocking pool when the runtime shuts down. A stuck
-/// job must not hold the process open forever — the service manager's SIGKILL
+/// task must not hold the process open forever — the service manager's SIGKILL
 /// (after `TimeoutStopSec` / launchd's exit timeout) is the final backstop.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -207,19 +194,6 @@ impl LogFilePath {
     }
 }
 
-// ================ SYNC SETTINGS ================
-/// Resolved configuration of one sync source (env-namespaced per source).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SyncSettings {
-    /// Market-local time of day the source runs at.
-    pub at: NaiveTime,
-    pub recurrence: Recurrence,
-    /// Base of the terminal-failure cooldown, in seconds.
-    pub cooldown_secs: u32,
-    /// Bound on unattended sequential catch-up, in business days.
-    pub max_backfill_days: u32,
-}
-
 // ================ ENGINE CONFIGURATION ================
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -228,10 +202,6 @@ pub struct EngineConfig {
     /// `None` = file logging disabled.
     log_file: Option<LogFilePath>,
     durable: bool,
-    maintenance_interval: Duration,
-    heartbeat_interval: Duration,
-    /// `None` = CVM sync disabled.
-    cvm_sync: Option<SyncSettings>,
 }
 
 impl EngineConfig {
@@ -243,23 +213,6 @@ impl EngineConfig {
             socket_path: SocketPath::resolve()?,
             log_file: LogFilePath::resolve()?,
             durable: durable_from(std::env::var_os(ENGINE_DURABLE_ENV)),
-            maintenance_interval: Duration::from_secs(interval_secs_from(
-                ENGINE_MAINTENANCE_INTERVAL_ENV,
-                std::env::var_os(ENGINE_MAINTENANCE_INTERVAL_ENV),
-                DEFAULT_MAINTENANCE_INTERVAL_SECS,
-            )?),
-            heartbeat_interval: Duration::from_secs(interval_secs_from(
-                ENGINE_HEARTBEAT_INTERVAL_ENV,
-                std::env::var_os(ENGINE_HEARTBEAT_INTERVAL_ENV),
-                DEFAULT_HEARTBEAT_INTERVAL_SECS,
-            )?),
-            cvm_sync: cvm_sync_from(
-                std::env::var_os(ENGINE_SYNC_CVM_ENV),
-                std::env::var_os(ENGINE_SYNC_CVM_AT_ENV),
-                std::env::var_os(ENGINE_SYNC_CVM_SCHEDULE_ENV),
-                std::env::var_os(ENGINE_SYNC_CVM_COOLDOWN_ENV),
-                std::env::var_os(ENGINE_SYNC_MAX_BACKFILL_DAYS_ENV),
-            )?,
         })
     }
 
@@ -293,19 +246,6 @@ impl EngineConfig {
 
     pub fn durability_label(&self) -> &'static str {
         if self.durable { "full" } else { "normal" }
-    }
-
-    pub fn maintenance_interval(&self) -> Duration {
-        self.maintenance_interval
-    }
-
-    pub fn heartbeat_interval(&self) -> Duration {
-        self.heartbeat_interval
-    }
-
-    /// CVM sync configuration; `None` when disabled via env.
-    pub fn cvm_sync(&self) -> Option<SyncSettings> {
-        self.cvm_sync
     }
 }
 
@@ -411,8 +351,6 @@ impl<'c> Bootstrap<'c> {
             db_path = %config.db_path().display(),
             socket_path = %config.socket_path().display(),
             lock_path = %config.lock_path().display(),
-            maintenance_interval_secs = config.maintenance_interval().as_secs(),
-            heartbeat_interval_secs = config.heartbeat_interval().as_secs(),
             durability = config.durability_label(),
             "valqeron-engine starting"
         );
@@ -810,21 +748,18 @@ impl GrpcServer {
 
 // ================ BACKGROUND TASK REGISTRATIONS ================
 /// Compose the engine's background work from the task implementations in
-/// `crate::jobs` — the manager itself knows nothing about them.
-fn background_tasks(
-    config: &EngineConfig,
-    started: Instant,
-    state: watch::Receiver<LifecycleState>,
-) -> BackgroundTasksBuilder {
-    let builder = BackgroundTasks::builder();
-    let builder = crate::jobs::system::register(builder, config, started, state);
-    crate::jobs::cvm::register(builder, config)
+/// `crate::tasks` — the scheduler itself knows nothing about them. Every
+/// task registers unconditionally; the registry decides what runs.
+fn scheduler(started: Instant, state: watch::Receiver<LifecycleState>) -> SchedulerBuilder {
+    let builder = Scheduler::builder();
+    let builder = crate::tasks::system::register(builder, started, state);
+    crate::tasks::cvm::register(builder)
 }
 
 // ================ SERVE LOOP ================
 /// Serve until a shutdown signal arrives or the server dies on its own, then
 /// hand off to the ordered drain. The mechanics live in [`Signals`],
-/// [`GrpcServer`], [`background_tasks`], and [`graceful_shutdown`]; this
+/// [`GrpcServer`], [`scheduler`], and [`graceful_shutdown`]; this
 /// function is only the orchestration order.
 async fn run_loop(
     storage: AsyncStorage,
@@ -851,9 +786,7 @@ async fn run_loop(
 
     // Background work (crash recovery, periodic schedules, the dispatcher)
     // runs on its own tasks; the select below stays a pure watcher.
-    let tasks = background_tasks(config, started, state)
-        .start(storage.clone())
-        .await;
+    let tasks = scheduler(started, state).start(storage.clone()).await;
 
     let outcome: EngineResult<&'static str> = tokio::select! {
         reason = signals.recv() => Ok(reason),
@@ -889,7 +822,7 @@ async fn run_loop(
 async fn graceful_shutdown(
     mut signals: Signals,
     mut server: GrpcServer,
-    tasks: BackgroundTasks,
+    tasks: Scheduler,
     storage: &AsyncStorage,
 ) -> EngineResult<()> {
     server.begin_shutdown();
@@ -945,136 +878,6 @@ fn durable_from(env_value: Option<OsString>) -> bool {
         .unwrap_or(false)
 }
 
-/// Whole-second interval from an environment variable. Unset or empty means
-/// the default; anything else must parse as `u64`, otherwise the engine
-/// refuses to start (misconfiguration must not silently become a default).
-fn interval_secs_from(
-    var: &'static str,
-    env_value: Option<OsString>,
-    default_secs: u64,
-) -> EngineResult<u64> {
-    let Some(value) = env_value else {
-        return Ok(default_secs);
-    };
-    let text = value.to_str().ok_or_else(|| {
-        EngineError::Config(format!("{var} must be whole seconds (not valid UTF-8)"))
-    })?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(default_secs);
-    }
-    trimmed.parse::<u64>().map_err(|e| {
-        EngineError::Config(format!("{var} must be whole seconds, got {trimmed:?}: {e}"))
-    })
-}
-
-/// Extract trimmed UTF-8 text from an env value: `Ok(None)` for unset or
-/// empty (use the default), `Err` for non-UTF-8.
-fn env_text(var: &'static str, env_value: Option<OsString>) -> EngineResult<Option<String>> {
-    let Some(value) = env_value else {
-        return Ok(None);
-    };
-    let text = value
-        .to_str()
-        .ok_or_else(|| EngineError::Config(format!("{var} is not valid UTF-8")))?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(trimmed.to_owned()))
-}
-
-/// A sync source is enabled by default; unset or empty keeps it enabled,
-/// an off-value (`off`/`false`/`0`/`none`) disables it.
-fn sync_enabled_from(env_value: Option<OsString>) -> bool {
-    env_value
-        .map(|value| value.is_empty() || !valqeron_common::os_str_is_off(&value))
-        .unwrap_or(true)
-}
-
-/// Market-local `HH:MM` from an environment variable; unset or empty means
-/// [`DEFAULT_SYNC_AT`]. Anything else must parse, otherwise the engine
-/// refuses to start.
-fn sync_time_from(var: &'static str, env_value: Option<OsString>) -> EngineResult<NaiveTime> {
-    let Some(text) = env_text(var, env_value)? else {
-        let (h, m) = DEFAULT_SYNC_AT;
-        return NaiveTime::from_hms_opt(h, m, 0)
-            .ok_or_else(|| EngineError::Config(format!("{var} default is invalid")));
-    };
-    NaiveTime::parse_from_str(&text, "%H:%M")
-        .map_err(|e| EngineError::Config(format!("{var} must be HH:MM, got {text:?}: {e}")))
-}
-
-/// Recurrence from an environment variable: unset/empty/`daily` →
-/// [`Recurrence::Daily`]; `weekly:<mon..sun>` → weekly on that day.
-fn recurrence_from(var: &'static str, env_value: Option<OsString>) -> EngineResult<Recurrence> {
-    let Some(text) = env_text(var, env_value)? else {
-        return Ok(Recurrence::Daily);
-    };
-    let lowered = text.to_ascii_lowercase();
-    if lowered == "daily" {
-        return Ok(Recurrence::Daily);
-    }
-    if let Some(day) = lowered.strip_prefix("weekly:") {
-        let on = match day {
-            "mon" => Weekday::Mon,
-            "tue" => Weekday::Tue,
-            "wed" => Weekday::Wed,
-            "thu" => Weekday::Thu,
-            "fri" => Weekday::Fri,
-            "sat" => Weekday::Sat,
-            "sun" => Weekday::Sun,
-            other => {
-                return Err(EngineError::Config(format!(
-                    "{var} weekday must be one of mon..sun, got {other:?}"
-                )));
-            }
-        };
-        return Ok(Recurrence::Weekly { on });
-    }
-    Err(EngineError::Config(format!(
-        "{var} must be \"daily\" or \"weekly:<mon..sun>\", got {text:?}"
-    )))
-}
-
-/// `u32` from an environment variable; unset or empty means the default.
-fn u32_from(var: &'static str, env_value: Option<OsString>, default: u32) -> EngineResult<u32> {
-    let Some(text) = env_text(var, env_value)? else {
-        return Ok(default);
-    };
-    text.parse::<u32>().map_err(|e| {
-        EngineError::Config(format!("{var} must be a whole number, got {text:?}: {e}"))
-    })
-}
-
-/// The CVM sync configuration, or `None` when disabled. Pure so tests never
-/// touch process-global environment state.
-fn cvm_sync_from(
-    enabled: Option<OsString>,
-    at: Option<OsString>,
-    schedule: Option<OsString>,
-    cooldown: Option<OsString>,
-    max_backfill: Option<OsString>,
-) -> EngineResult<Option<SyncSettings>> {
-    if !sync_enabled_from(enabled) {
-        return Ok(None);
-    }
-    Ok(Some(SyncSettings {
-        at: sync_time_from(ENGINE_SYNC_CVM_AT_ENV, at)?,
-        recurrence: recurrence_from(ENGINE_SYNC_CVM_SCHEDULE_ENV, schedule)?,
-        cooldown_secs: u32_from(
-            ENGINE_SYNC_CVM_COOLDOWN_ENV,
-            cooldown,
-            DEFAULT_SYNC_COOLDOWN_SECS,
-        )?,
-        max_backfill_days: u32_from(
-            ENGINE_SYNC_MAX_BACKFILL_DAYS_ENV,
-            max_backfill,
-            DEFAULT_SYNC_MAX_BACKFILL_DAYS,
-        )?,
-    }))
-}
-
 fn server_exit_error(
     joined: Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>,
 ) -> EngineError {
@@ -1108,9 +911,6 @@ mod config_tests {
             socket_path: SocketPath(PathBuf::from("/tmp/x.sock")),
             log_file: None,
             durable,
-            maintenance_interval: Duration::from_secs(10),
-            heartbeat_interval: Duration::from_secs(20),
-            cvm_sync: None,
         }
     }
 
@@ -1124,8 +924,6 @@ mod config_tests {
         assert_eq!(config.log_file(), None);
         assert_eq!(config.synchronous(), Synchronous::Full);
         assert_eq!(config.durability_label(), "full");
-        assert_eq!(config.maintenance_interval(), Duration::from_secs(10));
-        assert_eq!(config.heartbeat_interval(), Duration::from_secs(20));
     }
 
     #[test]
@@ -1231,185 +1029,6 @@ mod config_tests {
             );
         }
         assert!(!durable_from(None), "unset must keep the relaxed default");
-    }
-
-    #[test]
-    fn intervals_default_when_unset_or_empty_and_parse_when_set() {
-        for env_value in [None, Some(OsString::new()), Some(OsString::from("  "))] {
-            assert_eq!(
-                interval_secs_from(ENGINE_MAINTENANCE_INTERVAL_ENV, env_value, 3600).unwrap(),
-                3600
-            );
-        }
-        assert_eq!(
-            interval_secs_from(
-                ENGINE_MAINTENANCE_INTERVAL_ENV,
-                Some(OsString::from(" 42 ")),
-                3600
-            )
-            .unwrap(),
-            42
-        );
-    }
-
-    #[test]
-    fn invalid_intervals_are_config_errors_naming_the_variable() {
-        for bad in ["abc", "-1", "1.5", "10s"] {
-            let err = interval_secs_from(
-                ENGINE_HEARTBEAT_INTERVAL_ENV,
-                Some(OsString::from(bad)),
-                300,
-            )
-            .unwrap_err();
-            assert_eq!(err.exit_code(), exit_code::CONFIG, "{bad:?} must be CONFIG");
-            assert!(
-                err.to_string().contains(ENGINE_HEARTBEAT_INTERVAL_ENV),
-                "error must name the variable: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn sync_enabled_defaults_on_and_honors_off_values() {
-        assert!(sync_enabled_from(None), "unset means enabled");
-        assert!(
-            sync_enabled_from(Some(OsString::new())),
-            "empty means enabled"
-        );
-        for on in ["on", "1", "true", "yes"] {
-            assert!(
-                sync_enabled_from(Some(OsString::from(on))),
-                "{on:?} must keep the source enabled"
-            );
-        }
-        for off in ["off", "OFF", "false", "0", "none"] {
-            assert!(
-                !sync_enabled_from(Some(OsString::from(off))),
-                "{off:?} must disable the source"
-            );
-        }
-    }
-
-    #[test]
-    fn sync_time_defaults_parses_and_rejects_garbage() {
-        let default = NaiveTime::from_hms_opt(DEFAULT_SYNC_AT.0, DEFAULT_SYNC_AT.1, 0).unwrap();
-        for env_value in [None, Some(OsString::new()), Some(OsString::from("  "))] {
-            assert_eq!(
-                sync_time_from(ENGINE_SYNC_CVM_AT_ENV, env_value).unwrap(),
-                default
-            );
-        }
-        assert_eq!(
-            sync_time_from(ENGINE_SYNC_CVM_AT_ENV, Some(OsString::from(" 06:30 "))).unwrap(),
-            NaiveTime::from_hms_opt(6, 30, 0).unwrap()
-        );
-        for bad in ["25:00", "07:60", "seven", "07", "07:00:00extra"] {
-            let err =
-                sync_time_from(ENGINE_SYNC_CVM_AT_ENV, Some(OsString::from(bad))).unwrap_err();
-            assert_eq!(err.exit_code(), exit_code::CONFIG, "{bad:?} must be CONFIG");
-            assert!(
-                err.to_string().contains(ENGINE_SYNC_CVM_AT_ENV),
-                "error must name the variable: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn recurrence_parses_daily_and_weekly_and_rejects_garbage() {
-        for env_value in [
-            None,
-            Some(OsString::new()),
-            Some(OsString::from("daily")),
-            Some(OsString::from(" DAILY ")),
-        ] {
-            assert_eq!(
-                recurrence_from(ENGINE_SYNC_CVM_SCHEDULE_ENV, env_value).unwrap(),
-                Recurrence::Daily
-            );
-        }
-        assert_eq!(
-            recurrence_from(
-                ENGINE_SYNC_CVM_SCHEDULE_ENV,
-                Some(OsString::from("weekly:fri"))
-            )
-            .unwrap(),
-            Recurrence::Weekly { on: Weekday::Fri }
-        );
-        assert_eq!(
-            recurrence_from(
-                ENGINE_SYNC_CVM_SCHEDULE_ENV,
-                Some(OsString::from("WEEKLY:Mon"))
-            )
-            .unwrap(),
-            Recurrence::Weekly { on: Weekday::Mon }
-        );
-        for bad in ["monthly", "weekly", "weekly:funday", "daily:mon"] {
-            let err = recurrence_from(ENGINE_SYNC_CVM_SCHEDULE_ENV, Some(OsString::from(bad)))
-                .unwrap_err();
-            assert_eq!(err.exit_code(), exit_code::CONFIG, "{bad:?} must be CONFIG");
-            assert!(
-                err.to_string().contains(ENGINE_SYNC_CVM_SCHEDULE_ENV),
-                "error must name the variable: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn u32_values_default_and_reject_garbage() {
-        for env_value in [None, Some(OsString::new())] {
-            assert_eq!(
-                u32_from(ENGINE_SYNC_CVM_COOLDOWN_ENV, env_value, 300).unwrap(),
-                300
-            );
-        }
-        assert_eq!(
-            u32_from(
-                ENGINE_SYNC_CVM_COOLDOWN_ENV,
-                Some(OsString::from(" 42 ")),
-                300
-            )
-            .unwrap(),
-            42
-        );
-        for bad in ["abc", "-1", "1.5"] {
-            let err =
-                u32_from(ENGINE_SYNC_CVM_COOLDOWN_ENV, Some(OsString::from(bad)), 300).unwrap_err();
-            assert_eq!(err.exit_code(), exit_code::CONFIG, "{bad:?} must be CONFIG");
-        }
-    }
-
-    #[test]
-    fn cvm_sync_resolves_defaults_when_fully_unset() {
-        let settings = cvm_sync_from(None, None, None, None, None)
-            .unwrap()
-            .expect("enabled by default");
-        assert_eq!(
-            settings.at,
-            NaiveTime::from_hms_opt(DEFAULT_SYNC_AT.0, DEFAULT_SYNC_AT.1, 0).unwrap()
-        );
-        assert_eq!(settings.recurrence, Recurrence::Daily);
-        assert_eq!(settings.cooldown_secs, DEFAULT_SYNC_COOLDOWN_SECS);
-        assert_eq!(settings.max_backfill_days, DEFAULT_SYNC_MAX_BACKFILL_DAYS);
-    }
-
-    #[test]
-    fn cvm_sync_disabled_short_circuits_before_validating_the_rest() {
-        // With the source off, even invalid sibling values must not stop
-        // the engine.
-        let resolved = cvm_sync_from(
-            Some(OsString::from("off")),
-            Some(OsString::from("garbage")),
-            Some(OsString::from("garbage")),
-            Some(OsString::from("garbage")),
-            Some(OsString::from("garbage")),
-        );
-        assert!(matches!(resolved, Ok(None)));
-    }
-
-    #[test]
-    fn cvm_sync_invalid_values_refuse_to_start() {
-        let err = cvm_sync_from(None, Some(OsString::from("nope")), None, None, None).unwrap_err();
-        assert_eq!(err.exit_code(), exit_code::CONFIG);
     }
 
     #[test]
@@ -1520,9 +1139,6 @@ mod boot_tests {
             socket_path: SocketPath(dir.join("run").join("test.sock")),
             log_file: None,
             durable: false,
-            maintenance_interval: Duration::from_secs(3600),
-            heartbeat_interval: Duration::from_secs(3600),
-            cvm_sync: None,
         }
     }
 
@@ -1632,9 +1248,6 @@ mod boot_tests {
             socket_path: SocketPath(nested.join("run").join("test.sock")),
             log_file: None,
             durable: false,
-            maintenance_interval: Duration::from_secs(3600),
-            heartbeat_interval: Duration::from_secs(3600),
-            cvm_sync: None,
         };
 
         let engine = ValqeronEngine::boot(&config);

@@ -28,7 +28,8 @@ distinct period) → sync.
 | Survives restart | ✗ | ✓ | ✓ |
 | Catch-up | none | 1 slot | **unbounded, sequential** |
 | Progress state | — | — | `sync_cursor` |
-| `paused` honoured | durable only | ✓ | ✓ |
+| `enabled` honoured | durable only | ✓ | ✓ |
+| DB-tunable settings | `period_secs` (unless `.pinned()`) | `at_local`, `recurrence` | `at_local`, `recurrence`, `cooldown_secs`, `max_backfill_days` |
 | `RunWindow` | `None` | `None` | `Period { slot, target }` |
 
 One outcome vocabulary; each trigger interprets it, and the interpretation is what the execution history records
@@ -50,28 +51,25 @@ sequenceDiagram
     participant T as Trigger
     participant DB as write transaction
 
-    M->>T: cadence() → (first_tick, period)
-    Note over M: build ticker
+    M->>T: cadence() → (first_pass, fallback cap)
 
-    loop every tick / wake / until shutdown or stop(kind)
-        M->>T: mode()
-        alt TickMode::Seed
+    loop every sleep / wake / until shutdown or stop(kind)
+        M->>M: enabled (in-memory gate)?
+        alt disabled
+            Note over M: skip — zero DB work
+        else enabled, TickMode::Seed
             M->>DB: begin write txn
-            DB->>DB: registry.is_paused(kind)?
-            alt paused
-                DB-->>M: SeedPass::Paused
-            else not paused
-                DB->>T: reconcile(repos, now)
-                T->>DB: gate + insert (trigger's own logic)
-                T-->>DB: Seeded | Idle
-                DB-->>M: verdict
-            end
+            DB->>T: reconcile(repos, now)
+            T->>DB: gate + insert (trigger's own logic)
+            T-->>DB: Seeded | Idle { next_pass_at }
+            DB-->>M: verdict
             opt Seeded
                 M->>M: notify dispatcher
             end
-        else TickMode::Inline
+        else enabled, TickMode::Inline
             M->>M: run handler directly, no rows
         end
+        M->>M: sleep until min(hint, now + cap)
     end
 ```
 
@@ -86,9 +84,9 @@ tick → txn{ gate, reconcile }           tick → run handler inline
        (history + stats)                  (heartbeat, sd_watchdog)
 ```
 
-Inline runs deliberately **ignore `paused`** — they are liveness work, and pausing `sd_watchdog` would let systemd's
-watchdog kill the engine. They record no history and no stats (a few-second cadence would mean tens of thousands of
-pointless rows per day).
+Inline runs deliberately **ignore `enabled`** — they are liveness work, and disabling `sd_watchdog` would let
+systemd's watchdog kill the engine. They record no history and no stats (a few-second cadence would mean tens of
+thousands of pointless rows per day).
 
 **Serialisation.** Every durable trigger gates on `exists_active(kind)` — no new row while one is queued (every
 `task_queue` row is live by construction). A slow run never piles up behind itself; a sync source processes periods
@@ -100,15 +98,19 @@ Monotonic ticks since boot (`trigger/interval.rs`). For work that is about *now*
 missed occurrence costs nothing because the next tick does the same job.
 
 ```rust,ignore
-TaskDefinition::interval(DB_MAINTENANCE_TASK, config.maintenance_interval())
+TaskDefinition::interval(DB_MAINTENANCE_TASK, DEFAULT_MAINTENANCE_INTERVAL)
     .category(TaskCategory::EngineSystem)
     .run(handler)                    // defaults: durable, ±10% jitter, log ALL
 
-TaskDefinition::interval(HEARTBEAT_TASK, config.heartbeat_interval())
+TaskDefinition::interval(HEARTBEAT_TASK, DEFAULT_HEARTBEAT_INTERVAL)
     .category(TaskCategory::EngineSystem)
     .ephemeral()                     // inline, no jitter, log FAILURES_ONLY
     .run(handler)
 ```
+
+The period passed to the builder is the **code default**; the registry's `period_secs` (operator-tunable) is what
+actually runs. `.pinned()` opts a task out — its period stays code-computed at every boot (`sd_watchdog` derives it
+from `WATCHDOG_USEC`).
 
 ```text
 DURABLE                                 EPHEMERAL
@@ -119,7 +121,7 @@ tick → gate on exists_active            tick → run handler inline
      → history + stats
 
 retries, history, status,               no rows, no retries, no stats,
-pause honoured                          pause ignored (liveness work)
+enabled honoured                        enabled ignored (liveness work)
 
 db_maintenance                          heartbeat, sd_watchdog
 ```
@@ -133,9 +135,9 @@ jitter off (liveness wants precise cadence); `.no_jitter()` does the same for du
 
 | Kind | Period | Jitter | Tracking | Log policy |
 |---|---|---|---|---|
-| `db_maintenance` | `VALQERON_ENGINE_MAINTENANCE_INTERVAL` (3600s) | ✓ | Durable | `ALL` |
-| `heartbeat` | `VALQERON_ENGINE_HEARTBEAT_INTERVAL` (300s) | ✗ | Ephemeral | `FAILURES_ONLY` |
-| `sd_watchdog` | half of `WatchdogSec`; only under systemd | ✗ | Ephemeral | `FAILURES_ONLY` |
+| `db_maintenance` | `period_secs` (default 28800s = 8h) | ✓ | Durable | `ALL` |
+| `heartbeat` | `period_secs` (default 300s) | ✗ | Ephemeral | `FAILURES_ONLY` |
+| `sd_watchdog` | half of `WatchdogSec`; pinned, only under systemd | ✗ | Ephemeral | `FAILURES_ONLY` |
 
 > **When not to use it:** if you want "every day at 03:00" or "each weekday", you want [Recurring](#recurring). A
 > 24-hour interval is anchored to process start, drifts with every restart, and never fires on a machine that restarts
@@ -200,9 +202,10 @@ If every missed period matters, use [Sync](#sync).
 `Recurrence::Weekly { on }` anchors to one weekday and rolls forward if it is not a business day. For `task_prune` a
 Saturday prune waits until Monday — comfortably inside the 7-day retention window.
 
-`cadence()` returns `(now, RECONCILE_INTERVAL)`: the first pass runs **immediately at boot** (re-arming never waits),
-then every 60 seconds, and a completed run wakes the seeder directly so the next occurrence is armed within
-milliseconds.
+`cadence()` returns `(now, SEED_FALLBACK_INTERVAL)`: the first pass runs **immediately at boot** (re-arming never
+waits), a completed run wakes the seeder directly so the next occurrence is armed within milliseconds, and the
+10-minute fallback cap only self-heals a pass that failed transiently — with the armed row as the dispatcher's alarm,
+nothing clock-driven waits on the seeder.
 
 | Kind | Schedule | Retry |
 |---|---|---|
@@ -217,13 +220,16 @@ Cursor-driven recurrence with sequential catch-up (`trigger/sync.rs`). For work 
 TaskDefinition::sync(
     CVM_DAILY_SYNC_TASK,
     source,                                 // SyncSource: the cursor key
-    Schedule::new(MarketCalendar::B3, settings.at, settings.recurrence),
+    Schedule::new(MarketCalendar::B3, default_at(), Recurrence::Daily),
 )
-// defaults: retry 3×300s, cooldown base 300s, backfill cap 90 days
-.cooldown_secs(settings.cooldown_secs)
-.max_backfill_days(settings.max_backfill_days)
+// framework defaults: retry 3×300s, cooldown base 300s, backfill cap 90 days
+.cooldown_secs(DEFAULT_SYNC_COOLDOWN_SECS)
+.max_backfill_days(DEFAULT_SYNC_MAX_BACKFILL_DAYS)
 .run(handler)
 ```
+
+Everything but the calendar and the retry policy is a code *default*: the registry's `at_local`, `recurrence`,
+`cooldown_secs`, and `max_backfill_days` (operator-tunable) are what actually schedule the source.
 
 One `sync_cursor` row per source — durable, never pruned, independent of run history:
 
@@ -310,7 +316,9 @@ next_occurrence_after(cursor)           next_occurrence_after(cursor)
 ```
 
 Guaranteed **sequential** (one row in flight) and **chronological** (the cursor only advances on success), paced by
-handler completion rather than the 60-second tick.
+handler completion rather than any tick. Cooldown expiries are precise: the seed pass returns the cursor's
+`cooldown_until` as its hint (`SeedPass::Idle { next_pass_at }`), so the seeder sleeps exactly until the retry is
+allowed instead of polling for it.
 
 ### Failure semantics
 
@@ -390,4 +398,4 @@ The row payload is compact and parsed only inside this module; `window_for` deco
 | `cvm_daily_sync` | `cvm` | `sync:daily@07:00-03:00` | 3 × 300s | 300s base | 90 days |
 
 CVM's handler is currently a placeholder: it logs the period it would ingest and returns `Done`, which exercises the
-whole cursor machinery. Real ingestion changes only `jobs/cvm.rs`.
+whole cursor machinery. Real ingestion changes only `tasks/cvm.rs`.

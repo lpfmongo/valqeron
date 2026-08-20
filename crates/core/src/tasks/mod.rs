@@ -18,17 +18,18 @@
 //! Status is never stored: [`derive_status`] computes it from the catalog,
 //! the queue, and the cursors on every read.
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::common::RepositoryResult;
+use crate::schedule::Recurrence;
 use crate::tasks::error::{
     ExecutionOutcomeError, LogPolicyError, SyncOutcomeKindError, SyncSourceError, TaskBuilderError,
     TaskCategoryError, TaskKindError, TaskStatusError, TaskTrackingError, TaskTriggerError,
 };
 use crate::tasks::repository::{
-    BackgroundTaskRepository, SyncCursorRepository, TaskRegistrationRepository, TaskStatRepository,
+    BackgroundTaskRepository, SyncCursorRepository, TaskRegistryRepository, TaskStatRepository,
 };
 
 pub mod error;
@@ -650,7 +651,7 @@ pub enum TaskCategory {
     EngineSystem,
     /// Financial-instrument data ingestion (CVM, ANBIMA, B3, …).
     FinanceDataSync,
-    /// Everything else (reports, exports, custom jobs).
+    /// Everything else (reports, exports, custom tasks).
     Other,
 }
 
@@ -799,10 +800,35 @@ impl From<LogPolicy> for String {
     }
 }
 
+// ================ SETTINGS ================
+/// The operator-tunable scheduling knobs stored on the catalog row.
+///
+/// `None` means the knob is **code-owned**: either the task never declared
+/// it tunable (the boot reconcile leaves the column NULL forever and the
+/// scheduler always computes the value in code), or an operator cleared it
+/// back to NULL ("reset to default" — the next boot refills the code
+/// default). `Some` values are operator/DB truth: the boot reconcile never
+/// overwrites a non-NULL column, so they survive restarts and upgrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskSettings {
+    /// Interval trigger: seconds between runs.
+    pub period_secs: Option<u32>,
+    /// Recurring/sync triggers: market-local time of day.
+    pub at_local: Option<NaiveTime>,
+    /// Recurring/sync triggers: the recurrence.
+    pub recurrence: Option<Recurrence>,
+    /// Sync trigger: failure-cooldown base seconds.
+    pub cooldown_secs: Option<u32>,
+    /// Sync trigger: catch-up bound in business days.
+    pub max_backfill_days: Option<u32>,
+}
+
 // ================ DECLARATION ================
 /// What code declares about a task — the upsert payload of the boot
-/// reconcile. Everything else on the registration (intent, run summary) is
-/// operational state the reconcile must preserve.
+/// reconcile. Identity columns are rewritten every boot; `settings` are
+/// the code defaults that fill NULL columns only. Everything else on the
+/// registration (operator intent, run summary) the reconcile must
+/// preserve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDeclaration {
     pub kind: TaskKind,
@@ -815,8 +841,8 @@ pub struct TaskDeclaration {
     /// Sync trigger: the cursor key.
     pub source: Option<SyncSource>,
     pub log_policy: LogPolicy,
-    /// Environment verdict for this boot; `false` = configured off.
-    pub config_enabled: bool,
+    /// Code-default settings; `None` fields are not tunable for this task.
+    pub settings: TaskSettings,
 }
 
 // ================ THE REGISTRATION ================
@@ -829,8 +855,8 @@ pub struct TaskRegistration {
     schedule: String,
     source: Option<SyncSource>,
     log_policy: LogPolicy,
-    config_enabled: bool,
-    paused: bool,
+    enabled: bool,
+    settings: TaskSettings,
     registered: bool,
     first_registered_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -846,16 +872,16 @@ pub struct TaskRegistrationSnapshot {
     pub schedule: String,
     pub source: Option<SyncSource>,
     pub log_policy: LogPolicy,
-    pub config_enabled: bool,
-    pub paused: bool,
+    pub enabled: bool,
+    pub settings: TaskSettings,
     pub registered: bool,
     pub first_registered_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl TaskRegistration {
-    /// A fresh registration as its first declaration creates it: clean
-    /// intent.
+    /// A fresh registration as its first declaration creates it: enabled,
+    /// with the code-default settings.
     pub fn declared(declaration: TaskDeclaration, now: DateTime<Utc>) -> Self {
         Self {
             kind: declaration.kind,
@@ -865,8 +891,8 @@ impl TaskRegistration {
             schedule: declaration.schedule,
             source: declaration.source,
             log_policy: declaration.log_policy,
-            config_enabled: declaration.config_enabled,
-            paused: false,
+            enabled: true,
+            settings: declaration.settings,
             registered: true,
             first_registered_at: now,
             updated_at: now,
@@ -894,11 +920,11 @@ impl TaskRegistration {
     pub fn log_policy(&self) -> LogPolicy {
         self.log_policy
     }
-    pub fn config_enabled(&self) -> bool {
-        self.config_enabled
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
-    pub fn paused(&self) -> bool {
-        self.paused
+    pub fn settings(&self) -> &TaskSettings {
+        &self.settings
     }
     pub fn registered(&self) -> bool {
         self.registered
@@ -919,8 +945,8 @@ impl TaskRegistration {
             schedule: snapshot.schedule,
             source: snapshot.source,
             log_policy: snapshot.log_policy,
-            config_enabled: snapshot.config_enabled,
-            paused: snapshot.paused,
+            enabled: snapshot.enabled,
+            settings: snapshot.settings,
             registered: snapshot.registered,
             first_registered_at: snapshot.first_registered_at,
             updated_at: snapshot.updated_at,
@@ -934,10 +960,8 @@ impl TaskRegistration {
 pub enum DerivedTaskStatus {
     /// The kind is no longer registered in code.
     Retired,
-    /// Configured off via the environment for this boot.
+    /// Turned off by an operator; nothing seeds and nothing dispatches.
     Disabled,
-    /// Paused by an operator; seeding is stopped.
-    Paused,
     /// A run is executing right now.
     Running,
     /// Sync: consecutive terminal failures reached the halt threshold.
@@ -960,7 +984,6 @@ impl DerivedTaskStatus {
         match self {
             DerivedTaskStatus::Retired => "retired",
             DerivedTaskStatus::Disabled => "disabled",
-            DerivedTaskStatus::Paused => "paused",
             DerivedTaskStatus::Running => "running",
             DerivedTaskStatus::Halted => "halted",
             DerivedTaskStatus::CoolingDown => "cooling_down",
@@ -988,11 +1011,8 @@ pub fn derive_status(
     if !registration.registered() {
         return DerivedTaskStatus::Retired;
     }
-    if !registration.config_enabled() {
+    if !registration.enabled() {
         return DerivedTaskStatus::Disabled;
-    }
-    if registration.paused() {
-        return DerivedTaskStatus::Paused;
     }
     if active.is_some_and(|task| task.status() == TaskStatus::Running) {
         return DerivedTaskStatus::Running;
@@ -1042,7 +1062,13 @@ mod registration_tests {
             schedule: "sync:daily@07:00-03:00".into(),
             source: crate::tasks::SyncSource::new("cvm").ok(),
             log_policy: LogPolicy::All,
-            config_enabled: true,
+            settings: TaskSettings {
+                at_local: NaiveTime::from_hms_opt(7, 0, 0),
+                recurrence: Some(Recurrence::Daily),
+                cooldown_secs: Some(300),
+                max_backfill_days: Some(90),
+                ..TaskSettings::default()
+            },
         })
     }
 
@@ -1129,8 +1155,8 @@ mod registration_tests {
             return;
         };
         assert!(registration.registered());
-        assert!(!registration.paused());
-        assert!(registration.config_enabled());
+        assert!(registration.enabled());
+        assert_eq!(registration.settings().cooldown_secs, Some(300));
         assert_eq!(registration.category(), TaskCategory::FinanceDataSync);
     }
 
@@ -1148,8 +1174,8 @@ mod registration_tests {
             schedule: registration.schedule().to_owned(),
             source: registration.source().cloned(),
             log_policy: registration.log_policy(),
-            config_enabled: false,
-            paused: true,
+            enabled: false,
+            settings: *registration.settings(),
             registered: false,
             first_registered_at: now,
             updated_at: now,
@@ -1159,23 +1185,15 @@ mod registration_tests {
         assert_eq!(
             derive_status(&retired, running.as_ref(), None, 5, now),
             DerivedTaskStatus::Retired,
-            "retired wins over disabled/paused/running"
+            "retired wins over disabled/running"
         );
 
         snapshot_source.registered = true;
-        let disabled = TaskRegistration::reconstitute(snapshot_source.clone());
+        let disabled = TaskRegistration::reconstitute(snapshot_source);
         assert_eq!(
             derive_status(&disabled, running.as_ref(), None, 5, now),
             DerivedTaskStatus::Disabled,
-            "disabled wins over paused/running"
-        );
-
-        snapshot_source.config_enabled = true;
-        let paused = TaskRegistration::reconstitute(snapshot_source);
-        assert_eq!(
-            derive_status(&paused, running.as_ref(), None, 5, now),
-            DerivedTaskStatus::Paused,
-            "paused wins over running"
+            "disabled wins over running"
         );
     }
 
@@ -1297,7 +1315,7 @@ pub struct TaskStatusEntry {
 
 /// Assemble the status of every cataloged task (including retired ones).
 pub fn list_task_statuses(
-    registry: &impl TaskRegistrationRepository,
+    registry: &impl TaskRegistryRepository,
     tasks: &impl BackgroundTaskRepository,
     stats: &impl TaskStatRepository,
     cursors: &impl SyncCursorRepository,

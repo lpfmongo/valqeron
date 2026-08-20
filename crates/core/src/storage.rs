@@ -2,7 +2,7 @@ use crate::issuer::repository::IssuerRepository;
 use crate::security::repository::SecurityRepository;
 use crate::tasks::repository::{
     BackgroundTaskRepository, SyncCursorRepository, TaskExecutionRepository,
-    TaskRegistrationRepository, TaskStatRepository,
+    TaskRegistryRepository, TaskStatRepository,
 };
 
 mod error;
@@ -26,7 +26,7 @@ pub trait StorageEngine: Sized + Send + Sync {
     type Executions: TaskExecutionRepository;
     type Stats: TaskStatRepository;
     type Cursors: SyncCursorRepository;
-    type Registry: TaskRegistrationRepository;
+    type Registry: TaskRegistryRepository;
 
     fn repositories(&self) -> Repositories<Self>;
 

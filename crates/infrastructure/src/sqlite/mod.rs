@@ -9,7 +9,7 @@ mod support;
 mod sync_cursor;
 mod task;
 mod task_execution;
-mod task_registration;
+mod task_registry;
 mod task_stat;
 
 pub use crate::sqlite::database::{DatabaseConfig, Synchronous};

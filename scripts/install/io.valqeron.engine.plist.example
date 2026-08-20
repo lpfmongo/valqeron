@@ -45,13 +45,13 @@
   <string>/dev/null</string>
   <!-- Optional overrides, shown at the engine's own defaults
        (ProjectDirs "io", "valqeron", "valqeron"). Uncomment to customize.
-       Intervals are whole seconds; VALQERON_ENGINE_LOG_FILE=off disables the
-       JSON file log; a truthy VALQERON_ENGINE_DURABLE (e.g. 1) switches
-       writes to strict durability (PRAGMA synchronous=FULL, slower).
-       VALQERON_ENGINE_SYNC_CVM=off disables the CVM daily sync; _AT is
-       market-local HH:MM (America/Sao_Paulo); _SCHEDULE is "daily" or
-       "weekly:<mon..sun>"; _COOLDOWN is the failure-cooldown base in
-       seconds.
+       VALQERON_ENGINE_LOG_FILE=off disables the JSON file log; a truthy
+       VALQERON_ENGINE_DURABLE (e.g. 1) switches writes to strict durability
+       (PRAGMA synchronous=FULL, slower).
+
+       Background tasks are NOT configured here: enablement and scheduling
+       live in the database's task_registry table (operator-editable,
+       preserved across restarts) — see docs/src/tasks/operations.md.
   <key>EnvironmentVariables</key>
   <dict>
     <key>VALQERON_DB</key>
@@ -64,20 +64,6 @@
     <string>info</string>
     <key>VALQERON_ENGINE_DURABLE</key>
     <string>0</string>
-    <key>VALQERON_ENGINE_MAINTENANCE_INTERVAL</key>
-    <string>3600</string>
-    <key>VALQERON_ENGINE_HEARTBEAT_INTERVAL</key>
-    <string>300</string>
-    <key>VALQERON_ENGINE_SYNC_CVM</key>
-    <string>on</string>
-    <key>VALQERON_ENGINE_SYNC_CVM_AT</key>
-    <string>07:00</string>
-    <key>VALQERON_ENGINE_SYNC_CVM_SCHEDULE</key>
-    <string>daily</string>
-    <key>VALQERON_ENGINE_SYNC_CVM_COOLDOWN</key>
-    <string>300</string>
-    <key>VALQERON_ENGINE_SYNC_MAX_BACKFILL_DAYS</key>
-    <string>90</string>
   </dict>
   -->
 </dict>

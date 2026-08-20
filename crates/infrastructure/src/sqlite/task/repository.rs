@@ -100,6 +100,11 @@ impl BackgroundTaskRepository for SqliteBackgroundTaskRepository {
         .map_err(backend)
     }
 
+    fn next_due_at(&self) -> RepositoryResult<Option<DateTime<Utc>>> {
+        let conn = self.db.read();
+        queries::next_due_at(&conn).map_err(backend)
+    }
+
     fn complete(
         &self,
         id: &TaskId,
@@ -221,6 +226,53 @@ mod tests {
         assert_eq!(found.data.retry_delay_secs(), 60);
         assert!(found.data.started_at().is_none());
         assert!(found.data.last_error().is_none());
+    }
+
+    /// The watermark query: earliest PENDING `scheduled_at`, excluding
+    /// kinds an operator disabled (their frozen rows must not produce a
+    /// past watermark).
+    #[test]
+    fn next_due_at_reports_the_earliest_claimable_row() {
+        let (db, repo) = test_repo();
+        assert_eq!(repo.next_due_at().unwrap(), None, "empty queue");
+
+        // Millisecond precision: stored timestamps are canonical `.3f`.
+        let now = chrono::SubsecRound::trunc_subsecs(Utc::now(), 3);
+        let sooner = now + Duration::minutes(5);
+        let later = now + Duration::minutes(30);
+        let frozen = BackgroundTask::builder()
+            .kind(kind("frozen_kind"))
+            .scheduled_at(now - Duration::minutes(1))
+            .max_attempts(1)
+            .build()
+            .unwrap();
+        repo.insert(&frozen).unwrap();
+        repo.insert(&task_due_at(later, 1)).unwrap();
+        repo.insert(&task_due_at(sooner, 1)).unwrap();
+
+        // Without a registry row, every kind is claimable: the frozen
+        // kind's past-due row is the minimum.
+        let watermark = repo.next_due_at().unwrap().expect("rows queued");
+        assert!(watermark < now, "past-due row wins");
+
+        // Disable the kind: its rows leave the watermark entirely.
+        {
+            let handle = db.handle();
+            let conn = handle.write();
+            conn.execute_batch(
+                "INSERT INTO task_registry
+                     (kind, category, trigger_kind, tracking, schedule, log_policy,
+                      enabled, first_registered_at, updated_at)
+                 VALUES ('frozen_kind', 'OTHER', 'INTERVAL', 'DURABLE', 'interval:1s',
+                         'ALL', 0, '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z');",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            repo.next_due_at().unwrap(),
+            Some(sooner),
+            "disabled kinds are excluded; the earliest claimable row wins"
+        );
     }
 
     #[test]

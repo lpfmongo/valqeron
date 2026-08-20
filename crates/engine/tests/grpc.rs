@@ -44,6 +44,8 @@ impl Harness {
 
         // The binary takes no arguments: configuration is injected through
         // VALQERON_* env vars, with inherited ones scrubbed first.
+        // Task cadence lives in the registry (defaults: 8h maintenance,
+        // 300s heartbeat), quiet enough that nothing fires mid-test.
         let mut child = Command::new(BIN)
             .env_remove("RUST_LOG")
             .env_remove("VALQERON_ENGINE_LOG_LEVEL")
@@ -51,8 +53,6 @@ impl Harness {
             .env("VALQERON_DB", &db)
             .env("VALQERON_SOCKET", &socket)
             .env("VALQERON_ENGINE_LOG_FILE", "off")
-            .env("VALQERON_ENGINE_MAINTENANCE_INTERVAL", "3600")
-            .env("VALQERON_ENGINE_HEARTBEAT_INTERVAL", "3600")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
